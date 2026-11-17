@@ -5,7 +5,7 @@ An easy, lightweight way to move text, screenshots, and files between **Windows*
 
 [![CI](https://github.com/zeyadAhmed01/ClipBridge/actions/workflows/ci.yml/badge.svg)](https://github.com/zeyadAhmed01/ClipBridge/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Platform: Windows 10/11 & Android](https://img.shields.io/badge/Platform-Windows%2010%2F11%20%7C%20Android-0078D6)](#requirements-and-compatibility)
+[![Platform: Windows & Android](https://img.shields.io/badge/Platform-Windows%20%7C%20Android-0078D6)](#requirements-and-compatibility)
 [![Dependencies: Zero](https://img.shields.io/badge/Dependencies-Zero%20pip%20packages-10b981)](#requirements-and-compatibility)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b)](./LICENSE)
 
@@ -99,7 +99,7 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the full API and compon
 
 ClipBridge is designed for **trusted home or private Wi-Fi networks**:
 * **Authentication**: All endpoints except `/ping` require a matching `secret_key` (`X-Secret-Key` header or `?key=` query parameter), verified with constant-time `secrets.compare_digest`.
-* **Local-only storage**: Transferred files are staged temporarily in `%TEMP%\ClipBridge` and kept in session memory for history; nothing is sent to external servers.
+* **Local storage**: ClipBridge does not use a cloud service. Transferred files can remain under `%TEMP%\ClipBridge` after the application stops; history files can be duplicated on disk. Clearing in-app history removes history copies, but automatic expiry and bounded disk usage still need implementation. Do not use shared computers for sensitive transfers.
 * **Upload & filename safeguards**: Text payloads are capped at 2 MB, file uploads are capped at 512 MB by default (`max_upload_mb` in `config.json`), and filenames are sanitized against path traversal and Windows reserved device names.
 * **Important limitation (No TLS)**: Transfers and bearer credentials travel over **unencrypted HTTP**. Use only a trusted private LAN; never expose port `5050` to the internet. Browser links containing `?key=` may be retained in browser history or copied accidentally. ClipBridge is not end-to-end encrypted and is not recommended for secrets or sensitive documents.
 
@@ -113,12 +113,21 @@ Common issues (such as `timeout socket closed`, Windows Firewall Public network 
 
 ---
 
+## Current Limitations
+
+* This is a **source-first project**; there is no verified Windows installer or published GitHub Release yet. Python 3.10+ is required.
+* Android browser mode works without a dedicated ClipBridge APK. Quick Settings and Share-menu integration require the separate HTTP Shortcuts app.
+* Windows 10 compatibility, real-device Android workflows, and Windows clipboard/Toast behavior need manual acceptance testing before a broad release.
+* History/staged files can occupy disk space until manually cleared or cleaned up; automatic retention limits are planned.
+
+See [release readiness and manual testing checklist](./docs/RELEASE_READINESS.md).
+
 ## Roadmap
 
 * [ ] Optional QR code rendered in the terminal for instant mobile pairing
 * [ ] Optional self-signed HTTPS / TLS mode for local Wi-Fi encryption
 * [ ] Standalone Windows `.exe` release via PyInstaller (for users without Python installed)
-* [ ] Configurable auto-cleanup TTL for staged and history files
+* [ ] Configurable auto-cleanup TTL and disk quota for staged and history files
 
 ---
 

@@ -26,3 +26,7 @@ ClipBridge runs a multi-threaded HTTP server (`ThreadingHTTPServer`) on Windows 
 | `POST` | `/api/push-text` | Yes | Writes UTF-8 text (up to 2 MB) to Windows clipboard |
 | `POST` | `/api/push-files` | Yes | Streams multipart/raw files (up to `max_upload_mb`) to `%TEMP%\ClipBridge\staged` and sets Windows clipboard |
 | `POST` | `/api/history/clear` | Yes | Clears in-memory & staged session history |
+
+## Storage and concurrency caveats
+
+`TransferHistory.add_files()` creates local file copies under `%TEMP%\ClipBridge\history_files`. The UI's `max_history_items` limit bounds **in-memory entries**, not disk usage. Old copies can outlive a session or be orphaned by deque eviction. Concurrent uploads also reuse the shared `staged` directory. These limitations must be reviewed before a production-grade general release; see [release readiness](./RELEASE_READINESS.md).
