@@ -1,0 +1,19 @@
+name: Feature Request
+description: Suggest an improvement or new capability for ClipBridge
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow friction or limitation you're running into.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like ClipBridge to behave?
+    validations:
+      required: true

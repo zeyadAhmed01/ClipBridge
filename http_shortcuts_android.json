@@ -1,0 +1,109 @@
+{
+  "version": 80,
+  "compatibilityVersion": 70,
+  "categories": [
+    {
+      "id": "a1b2c3d4-0000-4000-8000-000000000001",
+      "name": "ClipBridge",
+      "layoutType": "linear_list",
+      "shortcuts": [
+        {
+          "id": "a1b2c3d4-0000-4000-8000-000000000011",
+          "name": "Send Text to PC",
+          "description": "Copies your Android clipboard (or shared text) directly into Windows Clipboard",
+          "iconName": "flat_color_upload",
+          "method": "POST",
+          "url": "http://{{bf000000-0000-4000-8000-000000000001}}:5050/api/push-text",
+          "headers": [
+            {
+              "key": "X-Secret-Key",
+              "value": "{{bf000000-0000-4000-8000-000000000002}}"
+            },
+            {
+              "key": "Content-Type",
+              "value": "text/plain; charset=utf-8"
+            }
+          ],
+          "bodyContent": "{{bf000000-0000-4000-8000-000000000003}}",
+          "requestBodyType": "custom_text",
+          "codeOnPrepare": "const shared = getVariable('text_payload');\nif (!shared || shared.trim() === '') {\n  setVariable('text_payload', getClipboardContent() || '');\n}",
+          "quickSettingsTileShortcut": true,
+          "responseHandling": {
+            "uiType": "toast",
+            "successOutput": "message",
+            "successMessage": "Copied text to Windows Clipboard (Ctrl+V ready)!"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-4000-8000-000000000012",
+          "name": "Send File or Screenshot to PC",
+          "description": "Share any screenshot or 1+ files (PDF, ZIP, video, doc) to put them in Windows Clipboard for Ctrl+V (+ Toast button to save to Downloads)",
+          "iconName": "flat_color_picture",
+          "method": "POST",
+          "url": "http://{{bf000000-0000-4000-8000-000000000001}}:5050/api/push-files",
+          "headers": [
+            {
+              "key": "X-Secret-Key",
+              "value": "{{bf000000-0000-4000-8000-000000000002}}"
+            }
+          ],
+          "requestBodyType": "form_data",
+          "parameters": [
+            {
+              "key": "files",
+              "type": "files",
+              "value": ""
+            }
+          ],
+          "quickSettingsTileShortcut": true,
+          "responseHandling": {
+            "uiType": "toast",
+            "successOutput": "message",
+            "successMessage": "Ready for Ctrl+V on Windows!"
+          }
+        },
+        {
+          "id": "a1b2c3d4-0000-4000-8000-000000000013",
+          "name": "Get from PC",
+          "description": "Copies PC text/images to Android Clipboard, or downloads copied Windows Explorer files to your phone's Downloads folder",
+          "iconName": "flat_color_download",
+          "method": "GET",
+          "url": "http://{{bf000000-0000-4000-8000-000000000001}}:5050/api/pull",
+          "headers": [
+            {
+              "key": "X-Secret-Key",
+              "value": "{{bf000000-0000-4000-8000-000000000002}}"
+            }
+          ],
+          "codeOnSuccess": "const data = JSON.parse(response.body);\nif (data.type === 'text') {\n  copyToClipboard(data.content);\n  showToast('Copied PC text to phone clipboard!');\n} else if (data.type === 'image') {\n  openUrl('http://' + getVariable('pc_ip') + ':5050/?key=' + getVariable('secret_key') + '&action=pull');\n} else if (data.type === 'files') {\n  if (data.files.length === 1) {\n    openUrl('http://' + getVariable('pc_ip') + ':5050' + data.files[0].url);\n  } else {\n    openUrl('http://' + getVariable('pc_ip') + ':5050/?key=' + getVariable('secret_key') + '&action=pull');\n  }\n} else {\n  showToast('Windows clipboard is empty');\n}",
+          "quickSettingsTileShortcut": true,
+          "responseHandling": {
+            "uiType": "toast",
+            "successOutput": "none"
+          }
+        }
+      ]
+    }
+  ],
+  "variables": [
+    {
+      "id": "bf000000-0000-4000-8000-000000000001",
+      "key": "pc_ip",
+      "type": "constant",
+      "value": "192.168.1.100"
+    },
+    {
+      "id": "bf000000-0000-4000-8000-000000000002",
+      "key": "secret_key",
+      "type": "constant",
+      "value": "replace-with-your-secret-key"
+    },
+    {
+      "id": "bf000000-0000-4000-8000-000000000003",
+      "key": "text_payload",
+      "type": "clipboard",
+      "value": "",
+      "shareText": true
+    }
+  ]
+}
