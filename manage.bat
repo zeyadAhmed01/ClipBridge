@@ -21,10 +21,11 @@ echo   [3] Restart Background Server
 echo   [4] Stop Background Server
 echo   [5] Remove Integration (Startup, Firewall ^& Protocol; keep data)
 echo   [6] Clean Temporary Storage (Safe / Non-Destructive)
+echo   [7] Configure Private LAN Firewall Only (Administrator)
 echo   [0] Exit
 echo.
 set "CHOICE="
-set /p CHOICE="Select an option (0-6): "
+set /p CHOICE="Select an option (0-7): "
 
 if "%CHOICE%"=="1" goto INSTALL
 if "%CHOICE%"=="2" goto STATUS
@@ -32,6 +33,7 @@ if "%CHOICE%"=="3" goto RESTART
 if "%CHOICE%"=="4" goto STOP
 if "%CHOICE%"=="5" goto UNINSTALL
 if "%CHOICE%"=="6" goto CLEANUP
+if "%CHOICE%"=="7" goto FIREWALL
 if "%CHOICE%"=="0" exit /b 0
 goto MENU
 
@@ -48,6 +50,12 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+exit /b 0
+
+:CHECK_ELEVATED
+set "CB_ELEVATED=0"
+powershell.exe -NoProfile -NonInteractive -Command "if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }" >nul 2>nul
+if not errorlevel 1 set "CB_ELEVATED=1"
 exit /b 0
 
 :READ_PORT
@@ -97,6 +105,14 @@ if exist "%CB_STATUS_FILE%" (
 exit /b 0
 
 :INSTALL
+call :CHECK_ELEVATED
+if "%CB_ELEVATED%"=="1" (
+    echo [ERROR] Never launch the ClipBridge background server from an elevated manager.
+    echo         Reopen manage.bat normally and select [1] to install and start.
+    echo         For the firewall only, launch manage.bat as Administrator and select [7].
+    pause
+    goto MENU
+)
 call :CHECK_PYTHON
 if errorlevel 1 goto MENU
 echo.
@@ -108,26 +124,14 @@ python "%PY_SCRIPT%" --register-only
 call :READ_PORT
 call :RESOLVE_RUNNER
 
-echo [3/4] Configuring Windows Firewall for port %CB_PORT% (Private / LocalSubnet)...
-net session >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    netsh advfirewall firewall delete rule name="ClipBridge_%CB_PORT%" >nul 2>nul
-    netsh advfirewall firewall delete rule name="ClipBridge_5050" >nul 2>nul
-    netsh advfirewall firewall delete rule name="ClipboardBridge_5050" >nul 2>nul
-    netsh advfirewall firewall add rule name="ClipBridge_%CB_PORT%" dir=in action=allow protocol=TCP localport=%CB_PORT% profile=private remoteip=localsubnet >nul 2>nul
-    if errorlevel 1 (
-        echo [WARNING] Failed to create Windows Firewall rule for port %CB_PORT%.
-    ) else (
-        echo   Firewall rule "ClipBridge_%CB_PORT%" configured ^(Private / LocalSubnet^).
-    )
+echo [3/4] Checking Windows Firewall for port %CB_PORT% (Private / LocalSubnet)...
+netsh advfirewall firewall show rule name="ClipBridge_%CB_PORT%" >nul 2>nul
+if errorlevel 1 (
+    echo [INFO] No ClipBridge firewall rule is configured for port %CB_PORT%.
+    echo        If Android cannot connect on your trusted Private LAN, use [7]
+    echo        from a separate Administrator manager session to configure it.
 ) else (
-    netsh advfirewall firewall show rule name="ClipBridge_%CB_PORT%" >nul 2>nul
-    if errorlevel 1 (
-        echo [WARNING] Firewall setup requires elevation and a trusted Private network.
-        echo           Run manage.bat as Administrator to allow port %CB_PORT% on Private/LocalSubnet.
-    ) else (
-        echo   Existing firewall rule "ClipBridge_%CB_PORT%" detected.
-    )
+    echo   A ClipBridge firewall rule exists; review its Private / LocalSubnet scope.
 )
 
 echo [4/4] Creating silent Windows Startup launcher ^& starting server...
@@ -176,6 +180,13 @@ pause
 goto MENU
 
 :RESTART
+call :CHECK_ELEVATED
+if "%CB_ELEVATED%"=="1" (
+    echo [ERROR] Restart the background server from a normal, non-elevated manager.
+    echo         For firewall configuration only, use [7].
+    pause
+    goto MENU
+)
 call :CHECK_PYTHON
 if errorlevel 1 goto MENU
 call :READ_PORT
@@ -207,6 +218,32 @@ echo [SUCCESS] ClipBridge background server stopped.
 pause
 goto MENU
 
+:FIREWALL
+call :CHECK_ELEVATED
+if not "%CB_ELEVATED%"=="1" (
+    echo [ERROR] The firewall-only action requires Administrator privileges.
+    echo         Close this manager, reopen it as Administrator, and choose [7].
+    echo         Then close the elevated window and run [1] normally.
+    pause
+    goto MENU
+)
+call :CHECK_PYTHON
+if errorlevel 1 goto MENU
+call :READ_PORT
+echo.
+echo Configuring ClipBridge Windows Firewall for port %CB_PORT%...
+echo Only the trusted Private network profile and local subnet are allowed.
+netsh advfirewall firewall delete rule name="ClipBridge_%CB_PORT%" >nul 2>nul
+netsh advfirewall firewall add rule name="ClipBridge_%CB_PORT%" dir=in action=allow protocol=TCP localport=%CB_PORT% profile=private remoteip=localsubnet >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not configure the firewall rule.
+) else (
+    echo [SUCCESS] Firewall rule configured. No server was started with elevated privileges.
+)
+echo.
+pause
+goto MENU
+
 :CLEANUP
 call :CHECK_PYTHON
 if errorlevel 1 goto MENU
@@ -226,7 +263,7 @@ if exist "%VBS_LAUNCHER%" del /F /Q "%VBS_LAUNCHER%"
 if exist "%STARTUP_DIR%\ClipboardBridge_SilentStartup.vbs" del /F /Q "%STARTUP_DIR%\ClipboardBridge_SilentStartup.vbs"
 
 set "FW_WARN=0"
-for %%R in ("ClipBridge_%CB_PORT%" "ClipBridge_5050" "ClipboardBridge_5050") do (
+for %%R in ("ClipBridge_%CB_PORT%") do (
     netsh advfirewall firewall show rule name=%%R >nul 2>nul
     if not errorlevel 1 (
         netsh advfirewall firewall delete rule name=%%R >nul 2>nul
@@ -235,7 +272,7 @@ for %%R in ("ClipBridge_%CB_PORT%" "ClipBridge_5050" "ClipboardBridge_5050") do 
 )
 if "%FW_WARN%"=="1" (
     echo [WARNING] One or more Windows Firewall rules could not be deleted without Administrator rights.
-    echo           Re-run manage.bat as Administrator to delete ClipBridge firewall rules.
+    echo           Re-run the manager as Administrator to delete this installation's firewall rule.
 )
 
 where python >nul 2>nul

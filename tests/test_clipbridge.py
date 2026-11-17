@@ -345,6 +345,34 @@ class TestClipBridgeUnit(unittest.TestCase):
         self.assertIn("Wait-Process", txt)
         self.assertIn("netsh advfirewall firewall show rule", txt)
         self.assertIn("--cleanup", txt)
+        self.assertIn(":CHECK_ELEVATED", txt)
+        self.assertIn('if "%CB_ELEVATED%"=="1"', txt)
+        self.assertIn('if "%CHOICE%"=="7" goto FIREWALL', txt)
+        self.assertIn("No server was started with elevated privileges", txt)
+        self.assertNotIn('for %%R in ("ClipBridge_%CB_PORT%" "ClipBridge_5050"', txt)
+
+    def test_failed_clipboard_adapter_does_not_strand_storage_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = cb.TransferHistory(
+                staged_dir=root / "staged",
+                history_files_dir=root / "history",
+                temp_dir=root,
+                max_storage_bytes=1024 * 1024,
+                get_clipboard_seq_fn=lambda: 1,
+                get_clipboard_files_fn=lambda: [],
+            )
+            token, staging_dir = history.begin_upload(4)
+            staged_file = staging_dir / "test.txt"
+            staged_file.write_bytes(b"test")
+
+            def failing_clipboard(_paths):
+                raise RuntimeError("clipboard adapter unavailable")
+
+            with self.assertRaisesRegex(RuntimeError, "adapter unavailable"):
+                history.commit_upload(token, staging_dir, [staged_file], "Phone -> PC", failing_clipboard)
+            self.assertFalse(history._inflight_uploads)
+            self.assertTrue(all(rec["leases"] == 0 for rec in history._transfers.values()))
 
     def test_run_cli_cleanup_offline_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:

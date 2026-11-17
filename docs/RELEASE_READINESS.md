@@ -11,6 +11,7 @@ The source was recovered from the repository's uploaded `ClipBridge-v1.0.0.zip` 
 - [ ] Run `python -m unittest discover -s tests -v` and inspect results, not just exit code
 - [ ] Run `python clipboard_bridge.py` on a fresh Windows 11 installation with Python 3.10+
 - [ ] Confirm the manager does not terminate any unrelated process that uses port 5050
+- [ ] Confirm ordinary server startup/restart is blocked in elevated sessions; configure Windows Firewall using option 7 only
 - [ ] Confirm the firewall rule is limited to **Private / LocalSubnet**, and does not allow public-network connections
 - [ ] Verify Android browser text transfer in **both directions** using a trusted home LAN
 - [ ] Verify HTTP Shortcuts **Import from URL**, Quick Settings tile, and Share-menu send from a real Android device

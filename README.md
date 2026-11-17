@@ -49,12 +49,12 @@ ClipBridge takes a minimal approach:
    git clone https://github.com/zeyadAhmed01/ClipBridge.git
    cd ClipBridge
    ```
-2. Run `manage.bat` on Windows. Use an elevated Command Prompt only if you need the manager to configure Windows Firewall.
+2. Run `manage.bat` as a **normal Windows user** (do not use **Run as administrator** for installation or restart).
 3. Press **`1`** (**Install & Start Silently**). This will:
    * Auto-create `config.json` with a random `secret_key`, your Windows `Downloads` path, and bounded temp storage defaults (`max_storage_mb`: `1024`, `retention_minutes`: `60`).
    * Register the `clipbridge://` protocol for the Toast **Save to Downloads** button.
-   * Attempt to allow port `5050` for **Private** network profiles and local-subnet clients only (requires administrator rights).
-   * Add a silent startup launcher to your Windows Startup folder and start the server.
+   * Check the existing Windows Firewall rule. If Android cannot connect, reopen **a separate** `manage.bat` window as Administrator and choose **option 7 — Configure Private LAN Firewall Only**. Close that elevated window afterward; start and restart ClipBridge only from a normal user session.
+   * Add a silent startup launcher to your current user's Windows Startup folder and start the server **without administrator privileges**.
    * You can also use option **`6`** in `manage.bat` (or `python clipboard_bridge.py --cleanup`) anytime to clean inactive temporary files without disturbing active clipboard transfers.
 4. Note the **Web Dashboard URL** and **Import from URL** printed in the terminal.
 

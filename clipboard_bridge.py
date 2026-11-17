@@ -477,6 +477,15 @@ class TransferHistory:
             ok = False
             try:
                 ok = bool(set_clipboard_fn(tx_paths))
+            except Exception:
+                # Even unexpected clipboard adapter failures must not leave a permanent lease.
+                # Keep the staged files for the normal retention window in case the OS
+                # partially accepted the transfer before the adapter raised.
+                with self.lock:
+                    rec = self._transfers.get(tx_id)
+                    if rec:
+                        rec["leases"] = max(0, rec["leases"] - 1)
+                raise
             finally:
                 with self.lock:
                     rec = self._transfers.get(tx_id)
