@@ -14,7 +14,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11"]
+        python-version: ["3.10", "3.12"]
 
     runs-on: ${{ matrix.os }}
 
@@ -32,8 +32,7 @@ jobs:
 
       - name: Validate JSON configuration files
         run: |
-          python -m json.tool http_shortcuts_android.json > /dev/null
-          python -m json.tool config.example.json > /dev/null
+          python -c "import json; [json.load(open(p, encoding='utf-8')) for p in ('http_shortcuts_android.json', 'config.example.json')]"
 
       - name: Run unit and HTTP integration tests
         run: python -m unittest discover -s tests -v

@@ -52,7 +52,7 @@ def load_or_create_config() -> dict:
     default_downloads = str(Path.home() / "Downloads")
     default_cfg = {
         "port": 5050,
-        "secret_key": f"clip-{secrets.token_hex(6)}",
+        "secret_key": f"clip-{secrets.token_hex(16)}",
         "save_folder": default_downloads,
         "max_history_items": 25,
         "max_upload_mb": 512,
@@ -1149,6 +1149,12 @@ window.addEventListener('DOMContentLoaded', () => {
 # HTTP REQUEST HANDLER
 # ==============================================================================
 class ClipboardRequestHandler(BaseHTTPRequestHandler):
+    def end_headers(self):
+        # Do not expose bearer-key URLs via referrer headers; disable MIME sniffing.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def log_message(self, format, *args):
         if sys.stdout and not sys.executable.lower().endswith("pythonw.exe"):
             msg = re.sub(r"(key=)[^&\s]+", r"\1***", format % args)

@@ -9,7 +9,7 @@ Thank you for considering contributing to **ClipBridge**!
    git clone https://github.com/zeyadAhmed01/ClipBridge.git
    cd ClipBridge
    ```
-2. Ensure **Python 3.8+** is installed (`python --version`). ClipBridge uses **zero third-party runtime dependencies**.
+2. Ensure **Python 3.10+** is installed (`python --version`). ClipBridge uses **zero third-party runtime dependencies**.
 3. Run the automated test suite (works on both Windows and Linux):
    ```powershell
    python -m unittest discover -s tests -v

@@ -112,6 +112,11 @@ class TestClipBridgeHTTP(unittest.TestCase):
             urlopen(req, timeout=3)
         self.assertEqual(ctx.exception.code, 413)
 
+    def test_security_headers(self):
+        with urlopen(f"http://127.0.0.1:{self.port}/ping", timeout=3) as resp:
+            self.assertEqual(resp.headers.get("Referrer-Policy"), "no-referrer")
+            self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+
     def test_no_permissive_cors_header(self):
         url = f"http://127.0.0.1:{self.port}/api/history?key={cb.SECRET_KEY}"
         with urlopen(url, timeout=3) as resp:

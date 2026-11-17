@@ -18,7 +18,7 @@ echo   [1] Install ^& Start Silently (Recommended First-Time Setup)
 echo   [2] Show Connection Info, Secret Key ^& Android Import URL
 echo   [3] Restart Background Server
 echo   [4] Stop Background Server
-echo   [5] Uninstall Completely (Remove Startup, Firewall ^& Protocol)
+echo   [5] Remove Integration (Startup, Firewall ^& Protocol; keep data)
 echo   [0] Exit
 echo.
 set /p CHOICE="Select an option (0-5): "
@@ -38,12 +38,100 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] ClipBridge requires Python 3.10 or newer.
+    exit /b 1
+)
 exit /b 0
 
 :STOP_PORT
-for /f "tokens=5" %%p in ('netstat -aon ^| findstr ":5050" ^| findstr "LISTENING"') do (
-    taskkill /F /PID %%p >nul 2>nul
+REM Stop only the ClipBridge Python process for this exact installation.
+REM Never terminate unrelated software simply because it owns port 5050.
+powershell.exe -NoProfile -NonInteractive -Command "$target = [IO.Path]::GetFullPath($env:PY_SCRIPT); Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^pythonw?\.exe
+
+:INSTALL
+call :CHECK_PYTHON
+if errorlevel 1 goto MENU
+echo.
+echo [1/4] Stopping any existing ClipBridge instance...
+call :STOP_PORT
+
+echo [2/4] Registering Windows Toast protocol ^& generating config.json...
+python "%PY_SCRIPT%" --register-only
+
+echo [3/4] Allowing Port 5050 through Windows Firewall...
+netsh advfirewall firewall delete rule name="ClipBridge_5050" >nul 2>nul
+netsh advfirewall firewall delete rule name="ClipboardBridge_5050" >nul 2>nul
+netsh advfirewall firewall add rule name="ClipBridge_5050" dir=in action=allow protocol=TCP localport=5050 profile=private remoteip=localsubnet >nul 2>nul
+if errorlevel 1 (
+    echo [WARNING] Firewall setup was not permitted. Use an elevated Command Prompt on a trusted Private network to configure the local-subnet rule.
 )
+
+echo [4/4] Creating silent Windows Startup launcher ^& starting server...
+(
+echo Set WshShell = CreateObject^("WScript.Shell"^)
+echo WshShell.Run "python ""%PY_SCRIPT%""", 0, False
+) > "%VBS_LAUNCHER%"
+wscript.exe "%VBS_LAUNCHER%"
+
+echo.
+echo [SUCCESS] ClipBridge is now running silently in the background!
+echo.
+pause
+goto MENU
+
+:STATUS
+call :CHECK_PYTHON
+if errorlevel 1 goto MENU
+echo.
+python "%PY_SCRIPT%" --register-only
+echo.
+echo Checking port 5050 status:
+netstat -aon | findstr ":5050" | findstr "LISTENING" >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    echo   Server Status : ONLINE ^(Listening on port 5050^)
+) else (
+    echo   Server Status : STOPPED
+)
+echo.
+pause
+goto MENU
+
+:RESTART
+echo.
+echo Restarting ClipBridge background server...
+call :STOP_PORT
+if exist "%VBS_LAUNCHER%" (
+    wscript.exe "%VBS_LAUNCHER%"
+) else (
+    start "" /B pythonw "%PY_SCRIPT%"
+)
+echo [SUCCESS] Server restarted!
+pause
+goto MENU
+
+:STOP
+echo.
+echo Stopping ClipBridge background server...
+call :STOP_PORT
+echo [SUCCESS] Server stopped.
+pause
+goto MENU
+
+:UNINSTALL
+echo.
+echo Removing ClipBridge system integrations (configuration and transfers are retained)...
+call :STOP_PORT
+if exist "%VBS_LAUNCHER%" del /F /Q "%VBS_LAUNCHER%"
+if exist "%STARTUP_DIR%\ClipboardBridge_SilentStartup.vbs" del /F /Q "%STARTUP_DIR%\ClipboardBridge_SilentStartup.vbs"
+netsh advfirewall firewall delete rule name="ClipBridge_5050" >nul 2>nul
+netsh advfirewall firewall delete rule name="ClipboardBridge_5050" >nul 2>nul
+python "%PY_SCRIPT%" --unregister
+echo [SUCCESS] ClipBridge has been stopped and removed from Windows Startup.
+pause
+goto MENU
+ -and $_.CommandLine -and $_.CommandLine.Contains($target) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 exit /b 0
 
 :INSTALL
