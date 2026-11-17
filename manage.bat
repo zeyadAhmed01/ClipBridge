@@ -53,9 +53,12 @@ if errorlevel 1 (
 exit /b 0
 
 :CHECK_ELEVATED
-set "CB_ELEVATED=0"
-powershell.exe -NoProfile -NonInteractive -Command "if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }" >nul 2>nul
-if not errorlevel 1 set "CB_ELEVATED=1"
+REM Fail closed: if PowerShell cannot identify the token, do not start the server.
+set "CB_ELEVATED=UNKNOWN"
+powershell.exe -NoProfile -NonInteractive -Command "if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 21 }" >nul 2>nul
+set "CB_CHECK_CODE=%ERRORLEVEL%"
+if "%CB_CHECK_CODE%"=="0" set "CB_ELEVATED=1"
+if "%CB_CHECK_CODE%"=="21" set "CB_ELEVATED=0"
 exit /b 0
 
 :READ_PORT
@@ -106,7 +109,7 @@ exit /b 0
 
 :INSTALL
 call :CHECK_ELEVATED
-if "%CB_ELEVATED%"=="1" (
+if not "%CB_ELEVATED%"=="0" (
     echo [ERROR] Never launch the ClipBridge background server from an elevated manager.
     echo         Reopen manage.bat normally and select [1] to install and start.
     echo         For the firewall only, launch manage.bat as Administrator and select [7].
@@ -181,7 +184,7 @@ goto MENU
 
 :RESTART
 call :CHECK_ELEVATED
-if "%CB_ELEVATED%"=="1" (
+if not "%CB_ELEVATED%"=="0" (
     echo [ERROR] Restart the background server from a normal, non-elevated manager.
     echo         For firewall configuration only, use [7].
     pause
