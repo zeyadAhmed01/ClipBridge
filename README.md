@@ -30,10 +30,11 @@ ClipBridge takes a minimal approach:
 * **Bidirectional Text Transfer**: Uses native Win32 `OpenClipboard` / `SetClipboardData` calls in Python with no subprocess overhead for text.
 * **Dual-Format Screenshot Paste (Android → Windows)**: Sharing a screenshot from Android places **both** an image `Bitmap` and a `FileDropList` on the Windows clipboard—paste it as an image in chat/design apps or as a `.png` file in File Explorer.
 * **Actionable Windows Toast Notifications**: Incoming screenshots and files pop up a native Windows 10/11 Toast notification with **Save to Downloads** and **Open Downloads** buttons (`clipbridge://`).
-* **Chunked Multi-File Transfers**: Stream single or multiple files (PDFs, ZIPs, videos, APKs) in 64 KB chunks without loading entire files into RAM.
+* **Chunked Multi-File Transfers**: Stream single or multiple files (PDFs, ZIPs, videos, APKs) in 64 KB chunks into isolated per-upload staging directories without loading entire files into RAM or colliding across concurrent requests.
+* **Bounded Local Retention & Clipboard Protection**: Configurable disk quota (`max_storage_mb`, default `1024 MB`), TTL (`retention_minutes`, default `60 min`), and history cap (`max_history_items`, default `25`) automatically reclaim old temporary files while protecting files still referenced by your active Windows clipboard or open downloads.
 * **PC → Android Pull**: Fetch copied Windows text or snipped screenshots (`Win+Shift+S`) to your Android clipboard, or download copied Windows Explorer files (`Ctrl+C`) straight to your phone's `Downloads` folder.
 * **1-Click "Import from URL" Onboarding**: ClipBridge serves `/setup/shortcuts.json` with your PC's local IP and generated secret key pre-filled.
-* **Session Transfer History**: Built-in dark-mode web dashboard (`http://<pc-ip>:5050/?key=<secret_key>`) with recent text and file history.
+* **Session Transfer History & Non-Destructive Cleanup**: Built-in dark-mode web dashboard (`http://<pc-ip>:5050/?key=<secret_key>`) with live temporary storage usage, non-destructive **Clean Temp**, and active-clipboard warnings before force-clearing.
 
 ---
 
@@ -50,10 +51,11 @@ ClipBridge takes a minimal approach:
    ```
 2. Run `manage.bat` on Windows. Use an elevated Command Prompt only if you need the manager to configure Windows Firewall.
 3. Press **`1`** (**Install & Start Silently**). This will:
-   * Auto-create `config.json` with a random `secret_key` and your Windows `Downloads` path.
+   * Auto-create `config.json` with a random `secret_key`, your Windows `Downloads` path, and bounded temp storage defaults (`max_storage_mb`: `1024`, `retention_minutes`: `60`).
    * Register the `clipbridge://` protocol for the Toast **Save to Downloads** button.
    * Attempt to allow port `5050` for **Private** network profiles and local-subnet clients only (requires administrator rights).
    * Add a silent startup launcher to your Windows Startup folder and start the server.
+   * You can also use option **`6`** in `manage.bat` (or `python clipboard_bridge.py --cleanup`) anytime to clean inactive temporary files without disturbing active clipboard transfers.
 4. Note the **Web Dashboard URL** and **Import from URL** printed in the terminal.
 
 ### 2. Connect from Android (Choose Either Method)
@@ -79,7 +81,7 @@ flowchart LR
 
 1. **Text transfers** are handled in-process via `user32.dll` and `kernel32.dll` (`ctypes`).
 2. **Images and Explorer files** use short-lived, timeout-bounded `powershell.exe -EncodedCommand` calls with `.NET` `System.Windows.Forms.Clipboard`.
-3. **Large uploads** are streamed in 64 KB chunks to `%TEMP%\ClipBridge\staged` and only copied to `Downloads` if you click **Save to Downloads** on the Windows Toast notification.
+3. **Large uploads** are streamed in 64 KB chunks into isolated per-transfer directories under `%TEMP%\ClipBridge\staged`, kept protected while Windows clipboard/Toast operations use them, and only copied to `Downloads` if you click **Save to Downloads** on the Windows Toast notification. Incomplete or aborted uploads are cleaned up automatically without replacing active clipboard data.
 
 See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the full API and component breakdown.
 
@@ -99,8 +101,8 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the full API and compon
 
 ClipBridge is designed for **trusted home or private Wi-Fi networks**:
 * **Authentication**: All endpoints except `/ping` require a matching `secret_key` (`X-Secret-Key` header or `?key=` query parameter), verified with constant-time `secrets.compare_digest`.
-* **Local storage**: ClipBridge does not use a cloud service. Transferred files can remain under `%TEMP%\ClipBridge` after the application stops; history files can be duplicated on disk. Clearing in-app history removes history copies, but automatic expiry and bounded disk usage still need implementation. Do not use shared computers for sensitive transfers.
-* **Upload & filename safeguards**: Text payloads are capped at 2 MB, file uploads are capped at 512 MB by default (`max_upload_mb` in `config.json`), and filenames are sanitized against path traversal and Windows reserved device names.
+* **Local storage**: ClipBridge does not use a cloud service. Uploaded and cached history files under `%TEMP%\ClipBridge` are bounded by `max_history_items` (`25`), `retention_minutes` (`60`), and `max_storage_mb` (`1024`), and orphaned files from prior sessions are reclaimed on server startup (preserving files still held on the live Windows clipboard). **Clean Temp** and **Clear** are non-destructive by default and warn before deleting files still referenced by the Windows clipboard. Do not use shared computers for sensitive transfers.
+* **Upload & filename safeguards**: Text payloads are capped at 2 MB, file uploads are capped at 512 MB by default (`max_upload_mb` in `config.json`, bounded by `max_storage_mb`), concurrent inflight uploads are isolated and resource-bounded, and filenames are sanitized against path traversal and Windows reserved device names.
 * **Important limitation (No TLS)**: Transfers and bearer credentials travel over **unencrypted HTTP**. Use only a trusted private LAN; never expose port `5050` to the internet. Browser links containing `?key=` may be retained in browser history or copied accidentally. ClipBridge is not end-to-end encrypted and is not recommended for secrets or sensitive documents.
 
 Read [`SECURITY.md`](./SECURITY.md) for vulnerability reporting and full security details.
@@ -118,7 +120,7 @@ Common issues (such as `timeout socket closed`, Windows Firewall Public network 
 * This is a **source-first project**; there is no verified Windows installer or published GitHub Release yet. Python 3.10+ is required.
 * Android browser mode works without a dedicated ClipBridge APK. Quick Settings and Share-menu integration require the separate HTTP Shortcuts app.
 * Windows 10 compatibility, real-device Android workflows, and Windows clipboard/Toast behavior need manual acceptance testing before a broad release.
-* History/staged files can occupy disk space until manually cleared or cleaned up; automatic retention limits are planned.
+* Temporary files remain unencrypted on disk under `%TEMP%\ClipBridge` while active or within the configured retention window (`retention_minutes`, `max_storage_mb`).
 
 See [release readiness and manual testing checklist](./docs/RELEASE_READINESS.md).
 
@@ -127,7 +129,7 @@ See [release readiness and manual testing checklist](./docs/RELEASE_READINESS.md
 * [ ] Optional QR code rendered in the terminal for instant mobile pairing
 * [ ] Optional self-signed HTTPS / TLS mode for local Wi-Fi encryption
 * [ ] Standalone Windows `.exe` release via PyInstaller (for users without Python installed)
-* [ ] Configurable auto-cleanup TTL and disk quota for staged and history files
+* [x] Configurable auto-cleanup TTL and disk quota for staged and history files
 
 ---
 

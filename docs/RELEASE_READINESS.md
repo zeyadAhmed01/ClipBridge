@@ -17,7 +17,7 @@ The source was recovered from the repository's uploaded `ClipBridge-v1.0.0.zip` 
 - [ ] Verify single and multi-file send, large transfer behavior, file save, Windows Toast actions, and clipboard paste in Explorer and an image app
 - [ ] Verify unauthorized requests fail, and that regenerated keys invalidate old shortcuts
 - [ ] Verify no secrets/personal paths or private transfer data exist in source, history, screenshots, or demo assets
-- [ ] Determine a safe disk-retention policy for staged/history copies; add cleanup and concurrency tests
+- [x] Implement bounded disk retention, startup orphan cleanup, isolated concurrent uploads, and automated regression tests (Issues #2 and #3)
 - [ ] Confirm browser image-copy fallback on actual Android Chrome without weakening secure-context policy
 - [ ] Capture a real screenshot or short demo with non-sensitive content and add it to README
 - [ ] Recheck README requirements and screenshots against reality
@@ -42,11 +42,10 @@ Keep this record factual. Do not mark anything passing without direct evidence.
 
 ## Known high-priority residual risks
 
-1. **Unbounded temp/history storage.** Session history caps the in-memory count, but files copied to `history_files` can remain after eviction/restart. A quota or deterministic cleanup strategy is needed.
-2. **Concurrent uploads.** Upload handlers currently share/clear one staging directory; verify isolation across concurrent requests.
-3. **Plain HTTP + bearer URLs.** Clipboard data and tokens are not encrypted in transit; limit use to a trusted LAN. Avoid public-network exposure and sharing import URLs.
-4. **Physical integration tests.** CI HTTP tests do not exercise the real Win32 clipboard, Windows Toast UI, Android Quick Settings, or the Share sheet.
-5. **Distribution friction.** No verified standalone Windows binary or code-signed installer is published; source installation currently needs Python.
+1. **Plain HTTP + bearer URLs.** Clipboard data and tokens are not encrypted in transit; limit use to a trusted LAN. Avoid public-network exposure and sharing import URLs.
+2. **Unencrypted local temp files while active/retained.** Files in `%TEMP%\ClipBridge` are bounded (`max_storage_mb`, `retention_minutes`) and reclaimed on cleanup/restart, but remain unencrypted while retained; avoid shared accounts/PCs for sensitive files.
+3. **Physical integration tests.** CI HTTP tests mock OS clipboard/Toast adapters on non-Windows/headless runners and do not exercise real Win32 clipboard paste, Windows Toast UI, Android Quick Settings, or the Share sheet.
+4. **Distribution friction.** No verified standalone Windows binary or code-signed installer is published; source installation currently needs Python 3.10+.
 
 ## GitHub repository settings requiring owner action
 

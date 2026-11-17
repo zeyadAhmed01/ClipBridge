@@ -43,6 +43,33 @@ WINDOWS_RESERVED_NAMES = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 MAX_TEXT_BYTES = 2 * 1024 * 1024  # 2 MB cap for text payloads
+MAX_CONCURRENT_UPLOADS = 16
+MAX_FILES_PER_UPLOAD = 100
+REQUEST_TIMEOUT_SEC = 60
+
+
+class IncompleteUploadError(ValueError):
+    """Raised when an upload stream ends before the full payload or closing boundary."""
+
+
+class UploadLimitError(ValueError):
+    """Raised when an upload exceeds structural limits (e.g., too many parts)."""
+
+
+class UploadBusyError(RuntimeError):
+    """Raised when concurrent inflight uploads exceed capacity or storage budget."""
+
+
+def _safe_int(value, default: int, min_val: int, max_val: int | None = None) -> int:
+    try:
+        num = int(value)
+    except (TypeError, ValueError):
+        num = default
+    if num < min_val:
+        num = min_val
+    if max_val is not None and num > max_val:
+        num = max_val
+    return num
 
 
 # ==============================================================================
@@ -56,11 +83,18 @@ def load_or_create_config() -> dict:
         "save_folder": default_downloads,
         "max_history_items": 25,
         "max_upload_mb": 512,
+        "max_storage_mb": 1024,
+        "retention_minutes": 60,
     }
     if CONFIG_PATH.exists():
         try:
             loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                loaded = {}
             merged = {**default_cfg, **loaded}
+            key_val = str(merged.get("secret_key") or "").strip()
+            if not key_val or key_val == "replace-with-your-secret-key":
+                merged["secret_key"] = f"clip-{secrets.token_hex(16)}"
             if merged != loaded:
                 CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
             return merged
@@ -75,89 +109,581 @@ def load_or_create_config() -> dict:
 
 
 CONFIG = load_or_create_config()
-PORT = int(CONFIG.get("port", 5050))
-SECRET_KEY = str(CONFIG.get("secret_key", "clip-default-key")).strip()
-SAVE_FOLDER = Path(CONFIG.get("save_folder", str(Path.home() / "Downloads")))
-MAX_HISTORY = int(CONFIG.get("max_history_items", 25))
-MAX_UPLOAD_BYTES = max(1, int(CONFIG.get("max_upload_mb", 512))) * 1024 * 1024
+PORT = _safe_int(CONFIG.get("port"), 5050, 1, 65535)
+SECRET_KEY = str(CONFIG.get("secret_key") or "").strip() or f"clip-{secrets.token_hex(16)}"
+SAVE_FOLDER = Path(CONFIG.get("save_folder") or str(Path.home() / "Downloads"))
+MAX_HISTORY = _safe_int(CONFIG.get("max_history_items"), 25, 1)
+MAX_UPLOAD_BYTES = _safe_int(CONFIG.get("max_upload_mb"), 512, 1) * 1024 * 1024
+MAX_STORAGE_BYTES = _safe_int(CONFIG.get("max_storage_mb"), 1024, 1) * 1024 * 1024
+RETENTION_SECONDS = _safe_int(CONFIG.get("retention_minutes"), 60, 1) * 60
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "ClipBridge"
 STAGED_DIR = TEMP_DIR / "staged"
 HISTORY_FILES_DIR = TEMP_DIR / "history_files"
 PC_CLIPBOARD_IMAGE_PATH = TEMP_DIR / "pc_clipboard.png"
+LATEST_TRANSFER_FILE = TEMP_DIR / "latest_transfer.json"
 
 for _d in (TEMP_DIR, STAGED_DIR, HISTORY_FILES_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
+def _is_strict_subpath(path: Path, root: Path) -> bool:
+    try:
+        p_res = path.resolve()
+        r_res = root.resolve()
+        return p_res != r_res and p_res.is_relative_to(r_res)
+    except Exception:
+        return False
+
+
+def _safe_rmtree(path: Path, allowed_roots: tuple[Path, ...] | list[Path]) -> bool:
+    if not any(_is_strict_subpath(path, root) for root in allowed_roots):
+        return False
+    if not path.exists() and not path.is_symlink():
+        return True
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+        return not path.exists()
+    except Exception:
+        return False
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        if path.is_file() and not path.is_symlink():
+            return path.stat().st_size
+        if not path.is_dir() or path.is_symlink():
+            return 0
+        for root, _, files in os.walk(path):
+            for fname in files:
+                fpath = Path(root) / fname
+                try:
+                    if not fpath.is_symlink():
+                        total += fpath.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _atomic_write_json(target: Path, payload: dict):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 # ==============================================================================
-# IN-MEMORY RECENT HISTORY TRACKER
+# BOUNDED TRANSFER STORAGE & SESSION HISTORY MANAGER
 # ==============================================================================
 class TransferHistory:
-    def __init__(self, maxlen: int = 25):
-        self.lock = threading.Lock()
-        self.items = deque(maxlen=maxlen)
+    def __init__(
+        self,
+        maxlen: int = MAX_HISTORY,
+        staged_dir: Path | None = None,
+        history_files_dir: Path | None = None,
+        temp_dir: Path | None = None,
+        max_storage_bytes: int | None = None,
+        retention_seconds: float | None = None,
+        get_clipboard_seq_fn=None,
+        get_clipboard_files_fn=None,
+    ):
+        self.lock = threading.RLock()
+        self.commit_lock = threading.Lock()
+        self.maxlen = max(1, int(maxlen))
+        self.staged_dir = staged_dir or STAGED_DIR
+        self.history_files_dir = history_files_dir or HISTORY_FILES_DIR
+        self.temp_dir = temp_dir or TEMP_DIR
+        self.max_storage_bytes = max(1, int(max_storage_bytes if max_storage_bytes is not None else MAX_STORAGE_BYTES))
+        self.retention_seconds = max(1.0, float(retention_seconds if retention_seconds is not None else RETENTION_SECONDS))
+        self._get_clipboard_seq_fn = get_clipboard_seq_fn
+        self._get_clipboard_files_fn = get_clipboard_files_fn
+        self._latest_transfer_file = self.temp_dir / "latest_transfer.json"
+
+        self.staged_dir.mkdir(parents=True, exist_ok=True)
+        self.history_files_dir.mkdir(parents=True, exist_ok=True)
+
+        self.session_id = f"{int(time.time())}_{secrets.token_hex(4)}"
+        self.items: deque[dict] = deque()
         self._counter = 0
+        self._seq = 0
+        self._transfers: dict[str, dict] = {}
+        self._active_clipboard_tid: str | None = None
+        self._inflight_uploads: dict[str, int] = {}
+
+    def _current_clipboard_seq(self) -> int | None:
+        if self._get_clipboard_seq_fn is not None:
+            return self._get_clipboard_seq_fn()
+        return win32_get_clipboard_sequence_number()
+
+    def _current_clipboard_files(self) -> list[Path]:
+        if self._get_clipboard_files_fn is not None:
+            return self._get_clipboard_files_fn()
+        return win32_get_clipboard_files()
+
+    def _is_transfer_protected_locked(self, rec: dict) -> tuple[bool, str]:
+        if rec["leases"] > 0:
+            return True, "active_operation"
+        if rec["transfer_id"] == self._active_clipboard_tid and rec.get("pinned_clipboard"):
+            expected_seq = rec.get("clipboard_seq")
+            if expected_seq is not None:
+                cur_seq = self._current_clipboard_seq()
+                if cur_seq is not None and cur_seq != expected_seq:
+                    rec["pinned_clipboard"] = False
+                    self._active_clipboard_tid = None
+                    return False, ""
+            return True, "active_clipboard"
+        return False, ""
+
+    def _remove_entry_by_transfer_id_locked(self, tid: str):
+        self.items = deque(item for item in self.items if item.get("transfer_id") != tid)
+
+    def _delete_transfer_locked(self, tid: str) -> int:
+        rec = self._transfers.get(tid)
+        if not rec:
+            return 0
+        freed = rec["bytes"]
+        _safe_rmtree(rec["dir"], (self.staged_dir, self.history_files_dir))
+        self._transfers.pop(tid, None)
+        if self._active_clipboard_tid == tid:
+            self._active_clipboard_tid = None
+        self._remove_entry_by_transfer_id_locked(tid)
+        self._sync_latest_pointer_if_removed_locked(tid)
+        return freed
+
+    def _sync_latest_pointer_if_removed_locked(self, removed_tid: str):
+        if not self._latest_transfer_file.exists():
+            return
+        try:
+            data = json.loads(self._latest_transfer_file.read_text(encoding="utf-8"))
+            if data.get("transfer_id") == removed_tid:
+                self._latest_transfer_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _write_latest_pointer_locked(self, tid: str, tx_dir: Path, files: list[Path], created_at: float):
+        _atomic_write_json(
+            self._latest_transfer_file,
+            {
+                "transfer_id": tid,
+                "dir": str(tx_dir.resolve()),
+                "files": [str(p.resolve()) for p in files],
+                "created_at": created_at,
+            },
+        )
+
+    def _cleanup_locked(self, force: bool = False, clear_all_inactive: bool = False, now: float | None = None) -> dict:
+        now_ts = time.time() if now is None else float(now)
+        reclaimed_bytes = 0
+        reclaimed_count = 0
+
+        # Refresh active clipboard pin before evaluating protection.
+        if self._active_clipboard_tid and self._active_clipboard_tid in self._transfers:
+            self._is_transfer_protected_locked(self._transfers[self._active_clipboard_tid])
+
+        # 1. Evict history items beyond maxlen (tracking their transfer_id for disk deletion).
+        while len(self.items) > self.maxlen:
+            old_item = self.items.pop()
+            old_tid = old_item.get("transfer_id")
+            if old_tid and old_tid in self._transfers:
+                self._transfers[old_tid]["evicted_from_history"] = True
+
+        # 2. Remove any already-evicted transfers that are no longer protected.
+        for tid in list(self._transfers.keys()):
+            rec = self._transfers.get(tid)
+            if not rec or not rec.get("evicted_from_history"):
+                continue
+            protected, _ = self._is_transfer_protected_locked(rec)
+            if not protected or (force and rec["leases"] == 0):
+                reclaimed_bytes += self._delete_transfer_locked(tid)
+                reclaimed_count += 1
+
+        # 3. Expire old text items and expired or inactive disk-backed transfers.
+        kept_items: deque[dict] = deque()
+        for item in self.items:
+            age = now_ts - float(item.get("created_at", now_ts))
+            if age >= self.retention_seconds and not item.get("transfer_id"):
+                continue
+            kept_items.append(item)
+        self.items = kept_items
+
+        ordered = sorted(
+            self._transfers.values(),
+            key=lambda r: (0 if r.get("evicted_from_history") else 1, r["created_at"], r["seq"]),
+        )
+        for rec in ordered:
+            tid = rec["transfer_id"]
+            if tid not in self._transfers:
+                continue
+            age = now_ts - rec["created_at"]
+            should_remove = clear_all_inactive or (age >= self.retention_seconds)
+            if not should_remove:
+                continue
+            protected, _ = self._is_transfer_protected_locked(rec)
+            if not protected or (force and rec["leases"] == 0):
+                reclaimed_bytes += self._delete_transfer_locked(tid)
+                reclaimed_count += 1
+
+        # 4. Enforce total on-disk quota across managed staged + history directories.
+        total_bytes = sum(r["bytes"] for r in self._transfers.values())
+        if total_bytes > self.max_storage_bytes:
+            ordered = sorted(
+                self._transfers.values(),
+                key=lambda r: (0 if r.get("evicted_from_history") else 1, r["created_at"], r["seq"]),
+            )
+            for rec in ordered:
+                if total_bytes <= self.max_storage_bytes:
+                    break
+                tid = rec["transfer_id"]
+                if tid not in self._transfers:
+                    continue
+                protected, _ = self._is_transfer_protected_locked(rec)
+                if protected and not (force and rec["leases"] == 0):
+                    continue
+                freed = self._delete_transfer_locked(tid)
+                reclaimed_bytes += freed
+                reclaimed_count += 1
+                total_bytes -= freed
+
+        preserved_items = []
+        for rec in self._transfers.values():
+            protected, reason = self._is_transfer_protected_locked(rec)
+            if protected:
+                preserved_items.append(
+                    {
+                        "transfer_id": rec["transfer_id"],
+                        "reason": reason,
+                        "files": [p.name for p in rec["files"]],
+                        "bytes": rec["bytes"],
+                    }
+                )
+
+        warning = ""
+        if preserved_items and (clear_all_inactive or force):
+            warning = (
+                f"Preserved {len(preserved_items)} active transfer(s) still referenced by "
+                "the Windows clipboard or active operations."
+            )
+
+        return {
+            "reclaimed_bytes": reclaimed_bytes,
+            "reclaimed_human": format_size(reclaimed_bytes),
+            "reclaimed_count": reclaimed_count,
+            "preserved_active_count": len(preserved_items),
+            "preserved_items": preserved_items,
+            "warning": warning,
+        }
+
+    def begin_upload(self, content_length: int) -> tuple[str, Path]:
+        with self.lock:
+            if len(self._inflight_uploads) >= MAX_CONCURRENT_UPLOADS:
+                raise UploadBusyError("Too many concurrent uploads in progress")
+            inflight_total = sum(self._inflight_uploads.values())
+            if inflight_total + content_length > self.max_storage_bytes:
+                raise UploadBusyError("Concurrent upload reservation exceeds storage budget")
+            token = f"{int(time.time() * 1000)}_{secrets.token_hex(6)}"
+            staging_dir = self.staged_dir / f".staging_{token}"
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            self._inflight_uploads[token] = content_length
+            return token, staging_dir
+
+    def abort_upload(self, token: str, staging_dir: Path | None):
+        if staging_dir is not None:
+            _safe_rmtree(staging_dir, (self.staged_dir,))
+        with self.lock:
+            self._inflight_uploads.pop(token, None)
+
+    def acquire_lease(self, transfer_id: str | None) -> bool:
+        if not transfer_id:
+            return False
+        with self.lock:
+            rec = self._transfers.get(transfer_id)
+            if not rec:
+                return False
+            rec["leases"] += 1
+            return True
+
+    def release_lease(self, transfer_id: str | None):
+        if not transfer_id:
+            return
+        with self.lock:
+            rec = self._transfers.get(transfer_id)
+            if rec and rec["leases"] > 0:
+                rec["leases"] -= 1
+            self._cleanup_locked(force=False)
+
+    def mark_clipboard_replaced(self):
+        with self.lock:
+            if self._active_clipboard_tid and self._active_clipboard_tid in self._transfers:
+                self._transfers[self._active_clipboard_tid]["pinned_clipboard"] = False
+            self._active_clipboard_tid = None
+            self._cleanup_locked(force=False)
+
+    def commit_upload(
+        self,
+        token: str,
+        staging_dir: Path,
+        staged_paths: list[Path],
+        direction: str,
+        set_clipboard_fn,
+    ) -> tuple[str, list[Path], dict, bool]:
+        """Atomically promote an isolated upload dir, set clipboard, and record bounded history."""
+        with self.commit_lock:
+            with self.lock:
+                self._seq += 1
+                self._counter += 1
+                seq = self._seq
+                entry_id = self._counter
+                tx_id = f"tx_{self.session_id}_{seq}_{token}"
+                tx_dir = self.staged_dir / tx_id
+                self._inflight_uploads.pop(token, None)
+
+            try:
+                staging_dir.rename(tx_dir)
+            except Exception:
+                shutil.move(str(staging_dir), str(tx_dir))
+
+            tx_paths = [tx_dir / p.name for p in staged_paths if (tx_dir / p.name).is_file()]
+            now_ts = time.time()
+            tx_bytes = _dir_size_bytes(tx_dir)
+
+            with self.lock:
+                self._transfers[tx_id] = {
+                    "transfer_id": tx_id,
+                    "dir": tx_dir,
+                    "kind": "staged",
+                    "bytes": tx_bytes,
+                    "created_at": now_ts,
+                    "seq": seq,
+                    "history_entry_id": entry_id,
+                    "leases": 1,  # Held across clipboard write + caller toast/response setup.
+                    "pinned_clipboard": False,
+                    "clipboard_seq": None,
+                    "evicted_from_history": False,
+                    "files": tx_paths,
+                }
+
+            ok = False
+            try:
+                ok = bool(set_clipboard_fn(tx_paths))
+            finally:
+                with self.lock:
+                    rec = self._transfers.get(tx_id)
+                    if rec:
+                        if ok:
+                            if self._active_clipboard_tid and self._active_clipboard_tid in self._transfers:
+                                self._transfers[self._active_clipboard_tid]["pinned_clipboard"] = False
+                            self._active_clipboard_tid = tx_id
+                            rec["pinned_clipboard"] = True
+                            rec["clipboard_seq"] = self._current_clipboard_seq()
+
+                        self._write_latest_pointer_locked(tx_id, tx_dir, tx_paths, now_ts)
+                        saved_records = []
+                        for idx, p in enumerate(tx_paths):
+                            size_b = p.stat().st_size if p.exists() else 0
+                            saved_records.append(
+                                {
+                                    "index": idx,
+                                    "name": p.name,
+                                    "path": str(p),
+                                    "size": size_b,
+                                    "size_human": format_size(size_b),
+                                    "is_image": p.suffix.lower() in IMAGE_EXTENSIONS,
+                                    "url": f"/api/history-file/{entry_id}/{idx}?key={SECRET_KEY}",
+                                }
+                            )
+                        entry = {
+                            "id": entry_id,
+                            "transfer_id": tx_id,
+                            "type": "files",
+                            "direction": direction,
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "created_at": now_ts,
+                            "files": saved_records,
+                        }
+                        self.items.appendleft(entry)
+                        self._cleanup_locked(force=False, now=now_ts)
+
+            return tx_id, tx_paths, entry, ok
 
     def add_text(self, text: str, direction: str) -> dict:
         with self.lock:
             self._counter += 1
+            now_ts = time.time()
             entry = {
                 "id": self._counter,
                 "type": "text",
                 "direction": direction,
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "created_at": now_ts,
                 "preview": text[:160] + ("..." if len(text) > 160 else ""),
                 "content": text,
             }
             self.items.appendleft(entry)
+            self._cleanup_locked(force=False, now=now_ts)
             return entry
 
     def add_files(self, file_paths: list[Path], direction: str) -> dict:
+        valid_sources = [src for src in file_paths if src.is_file()]
+        total_src_bytes = 0
+        for src in valid_sources:
+            try:
+                total_src_bytes += src.stat().st_size
+            except OSError:
+                pass
+
         with self.lock:
             self._counter += 1
+            self._seq += 1
             entry_id = self._counter
-            saved_records = []
-            entry_dir = HISTORY_FILES_DIR / f"item_{entry_id}"
-            entry_dir.mkdir(parents=True, exist_ok=True)
+            seq = self._seq
+            now_ts = time.time()
 
-            for idx, src in enumerate(file_paths):
-                if not src.is_file():
-                    continue
-                dst = entry_dir / src.name
-                if src.resolve() != dst.resolve():
+            saved_records = []
+            tid: str | None = None
+            if valid_sources and total_src_bytes <= self.max_storage_bytes:
+                tid = f"hist_{self.session_id}_{entry_id}"
+                entry_dir = self.history_files_dir / f"s_{self.session_id}_item_{entry_id}"
+                entry_dir.mkdir(parents=True, exist_ok=True)
+                copied_paths: list[Path] = []
+                for idx, src in enumerate(valid_sources):
+                    safe_name = sanitize_filename(src.name)
+                    dst = entry_dir / safe_name
+                    counter = 1
+                    while dst.exists():
+                        dst = entry_dir / f"{Path(safe_name).stem}_{counter}{Path(safe_name).suffix}"
+                        counter += 1
                     try:
                         shutil.copy2(src, dst)
+                        copied_paths.append(dst)
+                        size_b = dst.stat().st_size if dst.exists() else 0
+                        saved_records.append(
+                            {
+                                "index": idx,
+                                "name": dst.name,
+                                "path": str(dst),
+                                "size": size_b,
+                                "size_human": format_size(size_b),
+                                "is_image": dst.suffix.lower() in IMAGE_EXTENSIONS,
+                                "url": f"/api/history-file/{entry_id}/{idx}?key={SECRET_KEY}",
+                            }
+                        )
                     except Exception:
-                        dst = src
-                size_b = dst.stat().st_size if dst.exists() else 0
+                        pass
+
+                if copied_paths:
+                    self._transfers[tid] = {
+                        "transfer_id": tid,
+                        "dir": entry_dir,
+                        "kind": "history",
+                        "bytes": _dir_size_bytes(entry_dir),
+                        "created_at": now_ts,
+                        "seq": seq,
+                        "history_entry_id": entry_id,
+                        "leases": 0,
+                        "pinned_clipboard": False,
+                        "clipboard_seq": None,
+                        "evicted_from_history": False,
+                        "files": copied_paths,
+                    }
+                else:
+                    _safe_rmtree(entry_dir, (self.history_files_dir,))
+                    tid = None
+
+            entry = {
+                "id": entry_id,
+                "transfer_id": tid,
+                "type": "files",
+                "direction": direction,
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "created_at": now_ts,
+                "files": saved_records,
+            }
+            self.items.appendleft(entry)
+            self._cleanup_locked(force=False, now=now_ts)
+            return entry
+
+    def add_image_bytes(self, filename: str, data: bytes, direction: str) -> dict:
+        with self.lock:
+            self._counter += 1
+            self._seq += 1
+            entry_id = self._counter
+            seq = self._seq
+            now_ts = time.time()
+            saved_records = []
+            tid: str | None = None
+
+            if data and len(data) <= self.max_storage_bytes:
+                tid = f"hist_{self.session_id}_{entry_id}"
+                entry_dir = self.history_files_dir / f"s_{self.session_id}_item_{entry_id}"
+                entry_dir.mkdir(parents=True, exist_ok=True)
+                dst = entry_dir / sanitize_filename(filename, ".png")
+                dst.write_bytes(data)
+                self._transfers[tid] = {
+                    "transfer_id": tid,
+                    "dir": entry_dir,
+                    "kind": "history",
+                    "bytes": len(data),
+                    "created_at": now_ts,
+                    "seq": seq,
+                    "history_entry_id": entry_id,
+                    "leases": 0,
+                    "pinned_clipboard": False,
+                    "clipboard_seq": None,
+                    "evicted_from_history": False,
+                    "files": [dst],
+                }
                 saved_records.append(
                     {
-                        "index": idx,
+                        "index": 0,
                         "name": dst.name,
                         "path": str(dst),
-                        "size": size_b,
-                        "size_human": format_size(size_b),
+                        "size": len(data),
+                        "size_human": format_size(len(data)),
                         "is_image": dst.suffix.lower() in IMAGE_EXTENSIONS,
-                        "url": f"/api/history-file/{entry_id}/{idx}?key={SECRET_KEY}",
+                        "url": f"/api/history-file/{entry_id}/0?key={SECRET_KEY}",
                     }
                 )
 
             entry = {
                 "id": entry_id,
+                "transfer_id": tid,
                 "type": "files",
                 "direction": direction,
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "created_at": now_ts,
                 "files": saved_records,
             }
             self.items.appendleft(entry)
+            self._cleanup_locked(force=False, now=now_ts)
             return entry
 
     def list_items(self) -> list[dict]:
         with self.lock:
+            self._cleanup_locked(force=False)
             out = []
             for item in self.items:
-                copy_item = dict(item)
+                tid = item.get("transfer_id")
+                protected = False
+                if tid and tid in self._transfers:
+                    protected, _ = self._is_transfer_protected_locked(self._transfers[tid])
+                copy_item = {
+                    k: v
+                    for k, v in item.items()
+                    if k not in {"transfer_id", "created_at"}
+                }
+                copy_item["protected"] = protected
                 if copy_item["type"] == "files":
                     copy_item["files"] = [
                         {k: v for k, v in f.items() if k != "path"}
@@ -167,21 +693,303 @@ class TransferHistory:
             return out
 
     def get_file_path(self, entry_id: int, file_idx: int) -> Path | None:
+        path, tid = self.acquire_file_for_read(entry_id, file_idx)
+        if tid:
+            self.release_lease(tid)
+        return path
+
+    def acquire_file_for_read(self, entry_id: int, file_idx: int) -> tuple[Path | None, str | None]:
         with self.lock:
             for item in self.items:
                 if item["id"] == entry_id and item["type"] == "files":
                     for f in item["files"]:
                         if f["index"] == file_idx:
                             p = Path(f["path"])
-                            return p if p.is_file() else None
-            return None
+                            if not p.is_file():
+                                return None, None
+                            if not (
+                                _is_strict_subpath(p, self.staged_dir)
+                                or _is_strict_subpath(p, self.history_files_dir)
+                            ):
+                                return None, None
+                            tid = item.get("transfer_id")
+                            if tid and tid in self._transfers:
+                                self._transfers[tid]["leases"] += 1
+                            return p, tid
+            return None, None
 
-    def clear(self):
+    def acquire_latest_staged_files(self) -> tuple[str | None, list[Path]]:
         with self.lock:
-            self.items.clear()
-            if HISTORY_FILES_DIR.exists():
-                shutil.rmtree(HISTORY_FILES_DIR, ignore_errors=True)
-                HISTORY_FILES_DIR.mkdir(parents=True, exist_ok=True)
+            if self._latest_transfer_file.exists():
+                try:
+                    data = json.loads(self._latest_transfer_file.read_text(encoding="utf-8"))
+                    tid = data.get("transfer_id")
+                    if tid and tid in self._transfers:
+                        rec = self._transfers[tid]
+                        files = [p for p in rec["files"] if p.is_file()]
+                        if files:
+                            rec["leases"] += 1
+                            return tid, files
+                except Exception:
+                    pass
+            staged_recs = sorted(
+                (r for r in self._transfers.values() if r["kind"] == "staged"),
+                key=lambda r: (r["created_at"], r["seq"]),
+                reverse=True,
+            )
+            for rec in staged_recs:
+                files = [p for p in rec["files"] if p.is_file()]
+                if files:
+                    rec["leases"] += 1
+                    return rec["transfer_id"], files
+            return None, []
+
+    def get_storage_status(self) -> dict:
+        with self.lock:
+            self._cleanup_locked(force=False)
+            used_bytes = sum(r["bytes"] for r in self._transfers.values())
+            protected_items = []
+            reclaimable_bytes = 0
+            for rec in self._transfers.values():
+                protected, reason = self._is_transfer_protected_locked(rec)
+                if protected:
+                    protected_items.append(
+                        {
+                            "transfer_id": rec["transfer_id"],
+                            "reason": reason,
+                            "files": [p.name for p in rec["files"]],
+                            "bytes": rec["bytes"],
+                        }
+                    )
+                else:
+                    reclaimable_bytes += rec["bytes"]
+            return {
+                "status": "ok",
+                "used_bytes": used_bytes,
+                "used_human": format_size(used_bytes),
+                "quota_bytes": self.max_storage_bytes,
+                "quota_human": format_size(self.max_storage_bytes),
+                "retention_minutes": max(1, int(round(self.retention_seconds / 60))),
+                "staged_transfers": sum(1 for r in self._transfers.values() if r["kind"] == "staged"),
+                "history_items": len(self.items),
+                "protected_items": protected_items,
+                "reclaimable_bytes": reclaimable_bytes,
+                "reclaimable_human": format_size(reclaimable_bytes),
+            }
+
+    def cleanup(self, force: bool = False, reclaim_inactive: bool = False, now: float | None = None) -> dict:
+        with self.lock:
+            return self._cleanup_locked(force=force, clear_all_inactive=reclaim_inactive, now=now)
+
+    def clear(self, preserve_active: bool = False) -> dict:
+        with self.lock:
+            if not preserve_active:
+                self.items.clear()
+                reclaimed = 0
+                count = 0
+                for tid in list(self._transfers.keys()):
+                    rec = self._transfers[tid]
+                    if rec["leases"] > 0:
+                        rec["evicted_from_history"] = True
+                    else:
+                        reclaimed += self._delete_transfer_locked(tid)
+                        count += 1
+                self._active_clipboard_tid = None
+                try:
+                    self._latest_transfer_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return {
+                    "status": "ok",
+                    "reclaimed_bytes": reclaimed,
+                    "reclaimed_human": format_size(reclaimed),
+                    "reclaimed_count": count,
+                    "preserved_active_count": 0,
+                    "preserved_items": [],
+                    "warning": "",
+                }
+
+            # Non-destructive clear: drop text entries and inactive file entries,
+            # keeping files still actively needed by Windows clipboard or open leases.
+            new_items: deque[dict] = deque()
+            preserved_tids: set[str] = set()
+            for item in self.items:
+                tid = item.get("transfer_id")
+                if tid and tid in self._transfers:
+                    protected, _ = self._is_transfer_protected_locked(self._transfers[tid])
+                    if protected:
+                        new_items.append(item)
+                        preserved_tids.add(tid)
+            self.items = new_items
+
+            reclaimed = 0
+            count = 0
+            preserved_items = []
+            for tid in list(self._transfers.keys()):
+                rec = self._transfers[tid]
+                protected, reason = self._is_transfer_protected_locked(rec)
+                if protected or tid in preserved_tids:
+                    preserved_items.append(
+                        {
+                            "transfer_id": tid,
+                            "reason": reason,
+                            "files": [p.name for p in rec["files"]],
+                            "bytes": rec["bytes"],
+                        }
+                    )
+                else:
+                    reclaimed += self._delete_transfer_locked(tid)
+                    count += 1
+
+            warning = ""
+            if preserved_items:
+                names = ", ".join(
+                    fname for item in preserved_items for fname in item["files"][:2]
+                )
+                warning = (
+                    f"Kept {len(preserved_items)} active transfer(s) ({names}) still referenced "
+                    "by the Windows clipboard or active operations."
+                )
+            return {
+                "status": "ok",
+                "reclaimed_bytes": reclaimed,
+                "reclaimed_human": format_size(reclaimed),
+                "reclaimed_count": count,
+                "preserved_active_count": len(preserved_items),
+                "preserved_items": preserved_items,
+                "warning": warning,
+            }
+
+    def cleanup_orphans_on_startup(self, force: bool = False) -> dict:
+        """
+        Reclaim orphaned staged/history files left on disk by earlier runs without
+        touching anything outside TEMP_DIR or files currently referenced by Windows CF_HDROP.
+        """
+        clipboard_files = set()
+        if not force:
+            for p in self._current_clipboard_files():
+                try:
+                    clipboard_files.add(p.resolve())
+                except Exception:
+                    pass
+
+        reclaimed_bytes = 0
+        reclaimed_count = 0
+        adopted_files: list[str] = []
+
+        with self.lock:
+            # Clean previous-session history_files directories.
+            if self.history_files_dir.exists():
+                session_prefix = f"s_{self.session_id}_"
+                for child in list(self.history_files_dir.iterdir()):
+                    if child.name.startswith(session_prefix):
+                        continue
+                    reclaimed_bytes += _dir_size_bytes(child)
+                    if _safe_rmtree(child, (self.history_files_dir,)):
+                        reclaimed_count += 1
+
+            # Clean orphaned/in-flight staged entries; adopt live clipboard transfer if present.
+            adopted_tid: str | None = None
+            if self.staged_dir.exists():
+                for child in list(self.staged_dir.iterdir()):
+                    if child.name.startswith(f"tx_{self.session_id}_"):
+                        continue
+                    if child.name.startswith(".staging_"):
+                        reclaimed_bytes += _dir_size_bytes(child)
+                        if _safe_rmtree(child, (self.staged_dir,)):
+                            reclaimed_count += 1
+                        continue
+
+                    child_files: list[Path] = []
+                    if child.is_dir():
+                        child_files = [p for p in sorted(child.iterdir()) if p.is_file() and not p.is_symlink()]
+                    elif child.is_file() and not child.is_symlink():
+                        child_files = [child]
+
+                    referenced = False
+                    if not force and clipboard_files and child_files:
+                        for f in child_files:
+                            try:
+                                if f.resolve() in clipboard_files:
+                                    referenced = True
+                                    break
+                            except Exception:
+                                pass
+
+                    if referenced and child.is_dir():
+                        tid = child.name
+                        if tid not in self._transfers:
+                            self._seq += 1
+                            now_ts = time.time()
+                            self._transfers[tid] = {
+                                "transfer_id": tid,
+                                "dir": child,
+                                "kind": "staged",
+                                "bytes": _dir_size_bytes(child),
+                                "created_at": now_ts,
+                                "seq": self._seq,
+                                "history_entry_id": None,
+                                "leases": 0,
+                                "pinned_clipboard": True,
+                                "clipboard_seq": self._current_clipboard_seq(),
+                                "evicted_from_history": False,
+                                "files": child_files,
+                            }
+                            adopted_tid = tid
+                            self._active_clipboard_tid = tid
+                            self._write_latest_pointer_locked(tid, child, child_files, now_ts)
+                            adopted_files.extend(p.name for p in child_files)
+                    else:
+                        reclaimed_bytes += _dir_size_bytes(child)
+                        if _safe_rmtree(child, (self.staged_dir,)):
+                            reclaimed_count += 1
+
+            # Clean stale temporary pc_clipboard_*.tmp.png snapshots.
+            if self.temp_dir.exists():
+                for tmp_png in list(self.temp_dir.glob("pc_clipboard*.png")):
+                    if not force and tmp_png.name == PC_CLIPBOARD_IMAGE_PATH.name:
+                        continue
+                    try:
+                        reclaimed_bytes += tmp_png.stat().st_size
+                        tmp_png.unlink(missing_ok=True)
+                        reclaimed_count += 1
+                    except OSError:
+                        pass
+                if force and PC_CLIPBOARD_IMAGE_PATH.exists():
+                    try:
+                        reclaimed_bytes += PC_CLIPBOARD_IMAGE_PATH.stat().st_size
+                        PC_CLIPBOARD_IMAGE_PATH.unlink(missing_ok=True)
+                        reclaimed_count += 1
+                    except OSError:
+                        pass
+
+            if not adopted_tid and self._latest_transfer_file.exists():
+                try:
+                    data = json.loads(self._latest_transfer_file.read_text(encoding="utf-8"))
+                    ptr_tid = data.get("transfer_id")
+                    if ptr_tid not in self._transfers:
+                        self._latest_transfer_file.unlink(missing_ok=True)
+                except Exception:
+                    try:
+                        self._latest_transfer_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        warning = ""
+        if adopted_files:
+            warning = (
+                f"Preserved {len(adopted_files)} staged file(s) ({', '.join(adopted_files[:3])}) "
+                "currently referenced by the Windows clipboard."
+            )
+        return {
+            "status": "ok",
+            "reclaimed_bytes": reclaimed_bytes,
+            "reclaimed_human": format_size(reclaimed_bytes),
+            "reclaimed_count": reclaimed_count,
+            "preserved_active_count": 1 if adopted_tid else 0,
+            "preserved_files": adopted_files,
+            "warning": warning,
+        }
 
 
 HISTORY = TransferHistory(maxlen=MAX_HISTORY)
@@ -199,6 +1007,7 @@ GMEM_MOVEABLE = 0x0002
 if sys.platform == "win32":
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
 
     user32.OpenClipboard.argtypes = [wintypes.HWND]
     user32.OpenClipboard.restype = wintypes.BOOL
@@ -212,6 +1021,8 @@ if sys.platform == "win32":
     user32.GetClipboardData.restype = ctypes.c_void_p
     user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
     user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardSequenceNumber.argtypes = []
+    user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 
     kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     kernel32.GlobalAlloc.restype = ctypes.c_void_p
@@ -221,6 +1032,46 @@ if sys.platform == "win32":
     kernel32.GlobalUnlock.restype = wintypes.BOOL
     kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
     kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragQueryFileW.restype = wintypes.UINT
+
+
+def win32_get_clipboard_sequence_number() -> int | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        return int(user32.GetClipboardSequenceNumber())
+    except Exception:
+        return None
+
+
+def win32_get_clipboard_files() -> list[Path]:
+    if sys.platform != "win32":
+        return []
+    if not user32.IsClipboardFormatAvailable(CF_HDROP):
+        return []
+    if not _open_clipboard_with_retry():
+        return []
+    try:
+        h_drop = user32.GetClipboardData(CF_HDROP)
+        if not h_drop:
+            return []
+        count = shell32.DragQueryFileW(h_drop, 0xFFFFFFFF, None, 0)
+        paths: list[Path] = []
+        for idx in range(count):
+            length = shell32.DragQueryFileW(h_drop, idx, None, 0)
+            if length <= 0:
+                continue
+            buf = ctypes.create_unicode_buffer(length + 1)
+            shell32.DragQueryFileW(h_drop, idx, buf, length + 1)
+            if buf.value:
+                paths.append(Path(buf.value))
+        return paths
+    except Exception:
+        return []
+    finally:
+        user32.CloseClipboard()
 
 
 def _open_clipboard_with_retry(retries: int = 10, delay: float = 0.03) -> bool:
@@ -331,37 +1182,43 @@ def _xml_escape(text: str) -> str:
     )
 
 
-class WindowsBridge:
-    def __init__(self):
-        self.lock = threading.Lock()
+def _build_ps_toast_script(toast_xml: str) -> str:
+    b64_xml = base64.b64encode(toast_xml.encode("utf-8")).decode("ascii")
+    return f"""
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'
+$xmlString = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64_xml}'))
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml($xmlString)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
+"""
 
-    def set_clipboard_text(self, text: str) -> bool:
-        with self.lock:
-            return win32_set_clipboard_text(text)
 
-    def set_clipboard_files_and_optional_image(self, file_paths: list[Path]) -> bool:
-        if not file_paths:
-            return False
+def _build_ps_set_clipboard_script(file_paths: list[Path]) -> str:
+    single_image_path = None
+    if len(file_paths) == 1 and file_paths[0].suffix.lower() in IMAGE_EXTENSIONS:
+        single_image_path = str(file_paths[0].resolve())
 
-        add_lines = []
-        for p in file_paths:
-            esc = str(p.resolve()).replace("'", "''")
-            add_lines.append(f"$null = $sc.Add('{esc}')")
-        add_script = "\n".join(add_lines)
-
-        single_image_path = None
-        if len(file_paths) == 1 and file_paths[0].suffix.lower() in IMAGE_EXTENSIONS:
-            single_image_path = str(file_paths[0].resolve()).replace("'", "''")
-
-        if single_image_path:
-            ps = f"""
+    payload = {
+        "paths": [str(p.resolve()) for p in file_paths],
+        "image": single_image_path,
+    }
+    b64_json = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    if single_image_path:
+        return f"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+$json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64_json}'))
+$cfg = $json | ConvertFrom-Json
 $dataObj = New-Object System.Windows.Forms.DataObject
 $sc = New-Object System.Collections.Specialized.StringCollection
-{add_script}
+foreach ($p in $cfg.paths) {{
+    $null = $sc.Add([string]$p)
+}}
 $dataObj.SetFileDropList($sc)
-$img = [System.Drawing.Image]::FromFile('{single_image_path}')
+$img = [System.Drawing.Image]::FromFile([string]$cfg.image)
 try {{
     $dataObj.SetImage($img)
     [System.Windows.Forms.Clipboard]::SetDataObject($dataObj, $true)
@@ -370,14 +1227,34 @@ try {{
     $img.Dispose()
 }}
 """
-        else:
-            ps = f"""
+    return f"""
 Add-Type -AssemblyName System.Windows.Forms
+$json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64_json}'))
+$cfg = $json | ConvertFrom-Json
 $sc = New-Object System.Collections.Specialized.StringCollection
-{add_script}
+foreach ($p in $cfg.paths) {{
+    $null = $sc.Add([string]$p)
+}}
 [System.Windows.Forms.Clipboard]::SetFileDropList($sc)
 Write-Output "OK"
 """
+
+
+class WindowsBridge:
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def get_clipboard_sequence_number(self) -> int | None:
+        return win32_get_clipboard_sequence_number()
+
+    def set_clipboard_text(self, text: str) -> bool:
+        with self.lock:
+            return win32_set_clipboard_text(text)
+
+    def set_clipboard_files_and_optional_image(self, file_paths: list[Path]) -> bool:
+        if not file_paths:
+            return False
+        ps = _build_ps_set_clipboard_script(file_paths)
         with self.lock:
             res = run_ps_oneshot(ps, timeout_sec=10)
         return "OK" in res
@@ -400,10 +1277,12 @@ Write-Output "OK"
                     return {"type": "text", "data": txt} if txt else {"type": "empty"}
                 return {"type": "empty"}
 
-            escaped_img_path = str(PC_CLIPBOARD_IMAGE_PATH.resolve()).replace("'", "''")
+            tmp_img_path = TEMP_DIR / f"pc_clipboard_{threading.get_ident()}_{secrets.token_hex(4)}.tmp.png"
+            b64_img_path = base64.b64encode(str(tmp_img_path.resolve()).encode("utf-8")).decode("ascii")
             ps = f"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+$targetImgPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64_img_path}'))
 if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {{
     $files = [System.Windows.Forms.Clipboard]::GetFileDropList()
     $valid = @()
@@ -423,7 +1302,7 @@ if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {{
 if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
     $img = [System.Windows.Forms.Clipboard]::GetImage()
     if ($null -ne $img) {{
-        $img.Save('{escaped_img_path}', [System.Drawing.Imaging.ImageFormat]::Png)
+        $img.Save($targetImgPath, [System.Drawing.Imaging.ImageFormat]::Png)
         $img.Dispose()
         Write-Output "TYPE:IMAGE"
         exit 0
@@ -431,25 +1310,41 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
 }}
 Write-Output "TYPE:EMPTY"
 """
-            res = run_ps_oneshot(ps, timeout_sec=10)
-            if res.startswith("TYPE:FILES:"):
-                b64_part = res.split("TYPE:FILES:", 1)[1].strip()
-                raw_json = base64.b64decode(b64_part).decode("utf-8", errors="replace")
-                parsed = json.loads(raw_json)
-                if isinstance(parsed, str):
-                    parsed = [parsed]
-                paths = [Path(p) for p in parsed if Path(p).is_file()]
-                if paths:
-                    return {"type": "files", "paths": paths}
-            if res.startswith("TYPE:IMAGE") and PC_CLIPBOARD_IMAGE_PATH.exists():
-                return {"type": "image", "path": PC_CLIPBOARD_IMAGE_PATH}
-            if has_text:
-                txt = win32_get_clipboard_text()
-                if txt:
-                    return {"type": "text", "data": txt}
-            return {"type": "empty"}
+            try:
+                res = run_ps_oneshot(ps, timeout_sec=10)
+                if res.startswith("TYPE:FILES:"):
+                    b64_part = res.split("TYPE:FILES:", 1)[1].strip()
+                    raw_json = base64.b64decode(b64_part).decode("utf-8", errors="replace")
+                    parsed = json.loads(raw_json)
+                    if isinstance(parsed, str):
+                        parsed = [parsed]
+                    paths = [Path(p) for p in parsed if Path(p).is_file()]
+                    if paths:
+                        return {"type": "files", "paths": paths}
+                if res.startswith("TYPE:IMAGE") and tmp_img_path.exists():
+                    img_bytes = tmp_img_path.read_bytes()
+                    try:
+                        os.replace(tmp_img_path, PC_CLIPBOARD_IMAGE_PATH)
+                    except OSError:
+                        PC_CLIPBOARD_IMAGE_PATH.write_bytes(img_bytes)
+                    return {"type": "image", "path": PC_CLIPBOARD_IMAGE_PATH, "bytes": img_bytes}
+                if has_text:
+                    txt = win32_get_clipboard_text()
+                    if txt:
+                        return {"type": "text", "data": txt}
+                return {"type": "empty"}
+            finally:
+                try:
+                    tmp_img_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    def show_incoming_files_toast_async(self, file_paths: list[Path]):
+    def show_incoming_files_toast_async(
+        self,
+        file_paths: list[Path],
+        transfer_id: str | None = None,
+        history_store: TransferHistory | None = None,
+    ):
         if not file_paths:
             return
 
@@ -473,12 +1368,7 @@ Write-Output "TYPE:EMPTY"
             escaped_img = _xml_escape(str(file_paths[0].resolve()))
             hero_xml = f'<image placement="hero" src="{escaped_img}"/>'
 
-        ps = f"""
-$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-$appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'
-$xmlString = @"
-<toast activationType="protocol" launch="clipbridge://noop">
+        toast_xml = f"""<toast activationType="protocol" launch="clipbridge://noop">
     <visual>
         <binding template="ToastGeneric">
             <text>{safe_title}</text>
@@ -490,67 +1380,67 @@ $xmlString = @"
         <action content="Save to Downloads" arguments="clipbridge://save" activationType="protocol"/>
         <action content="Open Downloads" arguments="clipbridge://open" activationType="protocol"/>
     </actions>
-</toast>
-"@
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml($xmlString)
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
-"""
-        threading.Thread(target=run_ps_oneshot, args=(ps, 10), daemon=True).start()
+</toast>"""
+        ps = _build_ps_toast_script(toast_xml)
+
+        leased = bool(history_store and transfer_id and history_store.acquire_lease(transfer_id))
+
+        def _worker():
+            try:
+                run_ps_oneshot(ps, 10)
+            finally:
+                if leased and history_store and transfer_id:
+                    history_store.release_lease(transfer_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def show_simple_toast(self, title: str, message: str):
         safe_title = _xml_escape(title)
         safe_msg = _xml_escape(message)
-        ps = f"""
-$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-$appId = '{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe'
-$xmlString = @"
-<toast>
+        toast_xml = f"""<toast>
     <visual>
         <binding template="ToastGeneric">
             <text>{safe_title}</text>
             <text>{safe_msg}</text>
         </binding>
     </visual>
-</toast>
-"@
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml($xmlString)
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show($toast)
-"""
+</toast>"""
+        ps = _build_ps_toast_script(toast_xml)
         threading.Thread(target=run_ps_oneshot, args=(ps, 10), daemon=True).start()
 
 
 WIN_BRIDGE = WindowsBridge()
+PC_FILES_LOCK = threading.Lock()
 CURRENT_PC_FILES: list[Path] = []
 
 
 def sanitize_filename(name: str, default_ext: str = ".bin") -> str:
-    name = os.path.basename(unquote(name.strip()))
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
-    name = name.rstrip(" .")
-    if not name or name in {".", ".."}:
+    raw = unquote(name.strip()).replace("\\", "/")
+    base = raw.rsplit("/", 1)[-1].strip()
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", base)
+    base = base.rstrip(" .")
+    if not base or base in {".", ".."}:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         return f"Shared_{timestamp}{default_ext}"
-    stem = Path(name).stem.upper()
-    if stem in WINDOWS_RESERVED_NAMES:
-        name = f"_{name}"
-    return name[:180]
+    stem_part = base.split(".", 1)[0].upper()
+    if stem_part in WINDOWS_RESERVED_NAMES:
+        base = f"_{base}"
+    if len(base) > 180:
+        p = Path(base)
+        ext = p.suffix[:20]
+        stem = p.stem[: 180 - len(ext)].rstrip(" .") or "file"
+        base = f"{stem}{ext}"
+    return base.rstrip(" .") or f"Shared_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}{default_ext}"
 
 
-def save_staged_files_to_downloads() -> list[Path]:
-    if not STAGED_DIR.exists():
-        return []
-    staged_files = sorted([p for p in STAGED_DIR.iterdir() if p.is_file()])
+def _copy_files_to_downloads(staged_files: list[Path]) -> list[Path]:
     if not staged_files:
         return []
-
     SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
     saved_paths = []
     for src in staged_files:
+        if not src.is_file():
+            continue
         dest = SAVE_FOLDER / src.name
         counter = 1
         while dest.exists():
@@ -559,6 +1449,54 @@ def save_staged_files_to_downloads() -> list[Path]:
         shutil.copy2(src, dest)
         saved_paths.append(dest)
     return saved_paths
+
+
+def save_staged_files_to_downloads(history_store: TransferHistory | None = None) -> list[Path]:
+    if history_store is not None:
+        tid, files = history_store.acquire_latest_staged_files()
+        if not files:
+            return []
+        try:
+            return _copy_files_to_downloads(files)
+        finally:
+            history_store.release_lease(tid)
+
+    # Out-of-process path (e.g. clipbridge://save): read atomic pointer first,
+    # never touching in-progress .staging_* directories.
+    candidate_files: list[Path] = []
+    if LATEST_TRANSFER_FILE.exists():
+        try:
+            data = json.loads(LATEST_TRANSFER_FILE.read_text(encoding="utf-8"))
+            tx_dir = Path(str(data.get("dir", "")))
+            if _is_strict_subpath(tx_dir, STAGED_DIR) and tx_dir.is_dir():
+                for raw_f in data.get("files", []):
+                    fp = Path(str(raw_f))
+                    if _is_strict_subpath(fp, tx_dir) and fp.is_file():
+                        candidate_files.append(fp)
+                if not candidate_files:
+                    candidate_files = sorted(p for p in tx_dir.iterdir() if p.is_file())
+        except Exception:
+            candidate_files = []
+
+    if not candidate_files and STAGED_DIR.exists():
+        dirs = sorted(
+            (
+                d
+                for d in STAGED_DIR.iterdir()
+                if d.is_dir() and not d.name.startswith(".staging_")
+            ),
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        for d in dirs:
+            files = sorted(p for p in d.iterdir() if p.is_file())
+            if files:
+                candidate_files = files
+                break
+        if not candidate_files:
+            candidate_files = sorted(p for p in STAGED_DIR.iterdir() if p.is_file())
+
+    return _copy_files_to_downloads(candidate_files)
 
 
 def format_size(num_bytes: int) -> str:
@@ -712,8 +1650,14 @@ def stream_multipart_to_staged_dir(
     """
     Streams multipart/form-data from rfile in 64KB chunks directly to disk files
     inside target_dir without loading the entire upload body into memory.
+    Raises IncompleteUploadError if truncated/malformed or UploadLimitError if
+    too many parts are submitted; cleans up created partial files on error.
     """
+    if not boundary:
+        raise IncompleteUploadError("Missing multipart boundary")
+
     saved_paths: list[Path] = []
+    created_files: list[Path] = []
     delim = b"--" + boundary
     chunk_size = 65536
     remaining = content_length
@@ -722,121 +1666,153 @@ def stream_multipart_to_staged_dir(
     state = "FIND_BOUNDARY"
     current_file = None
     current_path: Path | None = None
+    seen_closing_boundary = False
 
-    while remaining > 0 or buf:
-        if remaining > 0 and len(buf) < chunk_size * 2:
+    def _fill(min_bytes: int):
+        nonlocal remaining, buf
+        while remaining > 0 and len(buf) < min_bytes:
             to_read = min(chunk_size, remaining)
             chunk = rfile.read(to_read)
             if not chunk:
-                remaining = 0
-            else:
-                remaining -= len(chunk)
-                buf += chunk
+                raise IncompleteUploadError("Upload stream interrupted before Content-Length bytes were received")
+            remaining -= len(chunk)
+            buf += chunk
 
-        if state == "FIND_BOUNDARY":
-            idx = buf.find(delim)
-            if idx == -1:
-                if remaining == 0:
-                    break
-                buf = buf[-len(delim) :]
-                continue
-            buf = buf[idx + len(delim) :]
-            if buf.startswith(b"--"):
-                break
-            if buf.startswith(b"\r\n"):
-                buf = buf[2:]
-            state = "READ_HEADERS"
+    try:
+        while remaining > 0 or buf:
+            if remaining > 0 and len(buf) < chunk_size * 2:
+                _fill(min(chunk_size * 2, len(buf) + remaining))
 
-        elif state == "READ_HEADERS":
-            hdr_end = buf.find(b"\r\n\r\n")
-            if hdr_end == -1:
-                if remaining == 0 or len(buf) > 32768:
-                    break
-                continue
-
-            header_bytes = buf[:hdr_end]
-            buf = buf[hdr_end + 4 :]
-            headers_text = header_bytes.decode("utf-8", errors="replace")
-
-            if "Content-Disposition" not in headers_text:
-                state = "FIND_BOUNDARY"
-                continue
-
-            filename = None
-            m_utf8 = re.search(r"filename\*=UTF-8''([^;\r\n]+)", headers_text, re.IGNORECASE)
-            if m_utf8:
-                filename = unquote(m_utf8.group(1).strip())
-            else:
-                m_std = re.search(r'filename="([^"\r\n]+)"', headers_text, re.IGNORECASE)
-                if m_std:
-                    filename = m_std.group(1).strip()
-
-            part_ctype = "application/octet-stream"
-            m_ct = re.search(r"Content-Type:\s*([^\r\n;]+)", headers_text, re.IGNORECASE)
-            if m_ct:
-                part_ctype = m_ct.group(1).strip()
-            ext = mimetypes.guess_extension(part_ctype) or ".bin"
-            if part_ctype == "image/jpeg":
-                ext = ".jpg"
-            elif part_ctype == "image/png":
-                ext = ".png"
-
-            if not filename:
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                prefix = "Screenshot" if ext in IMAGE_EXTENSIONS else "File"
-                filename = f"{prefix}_{timestamp}_{len(saved_paths) + 1}{ext}"
-            else:
-                filename = sanitize_filename(filename, ext)
-
-            target_path = target_dir / filename
-            counter = 1
-            while target_path.exists():
-                target_path = target_dir / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
-                counter += 1
-
-            current_path = target_path
-            current_file = target_path.open("wb")
-            state = "STREAM_BODY"
-
-        elif state == "STREAM_BODY":
-            needle = b"\r\n" + delim
-            idx = buf.find(needle)
-            if idx != -1:
-                if current_file:
-                    current_file.write(buf[:idx])
-                    current_file.close()
-                    current_file = None
-                if current_path and current_path.exists() and current_path.stat().st_size > 0:
-                    saved_paths.append(current_path)
-                elif current_path and current_path.exists():
-                    current_path.unlink(missing_ok=True)
-                current_path = None
-
-                buf = buf[idx + 2 + len(delim) :]
+            if state == "FIND_BOUNDARY":
+                idx = buf.find(delim)
+                if idx == -1:
+                    if remaining == 0:
+                        break
+                    if len(buf) > len(delim):
+                        buf = buf[-len(delim) :]
+                    continue
+                buf = buf[idx + len(delim) :]
+                if len(buf) < 2 and remaining > 0:
+                    _fill(2)
                 if buf.startswith(b"--"):
+                    seen_closing_boundary = True
                     break
                 if buf.startswith(b"\r\n"):
                     buf = buf[2:]
                 state = "READ_HEADERS"
-            else:
-                keep_tail = len(needle) + 8
-                if len(buf) > keep_tail:
-                    writable = buf[:-keep_tail]
+
+            elif state == "READ_HEADERS":
+                hdr_end = buf.find(b"\r\n\r\n")
+                if hdr_end == -1:
+                    if len(buf) > 32768:
+                        raise IncompleteUploadError("Multipart part header exceeds 32 KB limit")
+                    if remaining == 0:
+                        raise IncompleteUploadError("Truncated multipart part headers")
+                    continue
+
+                header_bytes = buf[:hdr_end]
+                buf = buf[hdr_end + 4 :]
+                headers_text = header_bytes.decode("utf-8", errors="replace")
+
+                if "Content-Disposition" not in headers_text:
+                    state = "FIND_BOUNDARY"
+                    continue
+
+                if len(saved_paths) >= MAX_FILES_PER_UPLOAD:
+                    raise UploadLimitError(f"Exceeded max files per upload ({MAX_FILES_PER_UPLOAD})")
+
+                filename = None
+                m_utf8 = re.search(r"filename\*=UTF-8''([^;\r\n]+)", headers_text, re.IGNORECASE)
+                if m_utf8:
+                    filename = unquote(m_utf8.group(1).strip())
+                else:
+                    m_std = re.search(r'filename="([^"\r\n]+)"', headers_text, re.IGNORECASE)
+                    if m_std:
+                        filename = m_std.group(1).strip()
+
+                part_ctype = "application/octet-stream"
+                m_ct = re.search(r"Content-Type:\s*([^\r\n;]+)", headers_text, re.IGNORECASE)
+                if m_ct:
+                    part_ctype = m_ct.group(1).strip()
+                ext = mimetypes.guess_extension(part_ctype) or ".bin"
+                if part_ctype == "image/jpeg":
+                    ext = ".jpg"
+                elif part_ctype == "image/png":
+                    ext = ".png"
+
+                if not filename:
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    prefix = "Screenshot" if ext in IMAGE_EXTENSIONS else "File"
+                    filename = f"{prefix}_{timestamp}_{len(saved_paths) + 1}{ext}"
+                else:
+                    filename = sanitize_filename(filename, ext)
+
+                target_path = target_dir / filename
+                counter = 1
+                while target_path.exists():
+                    target_path = target_dir / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
+                    counter += 1
+                if not _is_strict_subpath(target_path, target_dir):
+                    raise IncompleteUploadError("Resolved target path escaped staging directory")
+
+                current_path = target_path
+                current_file = target_path.open("wb")
+                created_files.append(target_path)
+                state = "STREAM_BODY"
+
+            elif state == "STREAM_BODY":
+                needle = b"\r\n" + delim
+                idx = buf.find(needle)
+                if idx != -1:
                     if current_file:
-                        current_file.write(writable)
-                    buf = buf[-keep_tail:]
-                elif remaining == 0:
-                    if current_file:
-                        current_file.write(buf)
+                        current_file.write(buf[:idx])
                         current_file.close()
                         current_file = None
                     if current_path and current_path.exists() and current_path.stat().st_size > 0:
                         saved_paths.append(current_path)
-                    buf = b""
-                    break
+                    elif current_path and current_path.exists():
+                        current_path.unlink(missing_ok=True)
+                    current_path = None
 
-    if current_file:
-        current_file.close()
+                    buf = buf[idx + 2 + len(delim) :]
+                    if len(buf) < 2 and remaining > 0:
+                        _fill(2)
+                    if buf.startswith(b"--"):
+                        seen_closing_boundary = True
+                        break
+                    if buf.startswith(b"\r\n"):
+                        buf = buf[2:]
+                    state = "READ_HEADERS"
+                else:
+                    keep_tail = len(needle) + 8
+                    if len(buf) > keep_tail:
+                        writable = buf[:-keep_tail]
+                        if current_file:
+                            current_file.write(writable)
+                        buf = buf[-keep_tail:]
+                    elif remaining == 0:
+                        raise IncompleteUploadError("Multipart payload ended before closing boundary")
+
+        if not seen_closing_boundary:
+            raise IncompleteUploadError("Multipart payload missing closing boundary")
+    except Exception:
+        if current_file:
+            try:
+                current_file.close()
+            except Exception:
+                pass
+        for p in created_files:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    finally:
+        if current_file:
+            try:
+                current_file.close()
+            except Exception:
+                pass
 
     return saved_paths
 
@@ -948,10 +1924,14 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
       <h2>3. Recent Transfer History</h2>
-      <button class="ghost" onclick="clearHistory()">Clear</button>
+      <div style="display:flex;gap:6px;">
+        <button class="ghost" onclick="cleanInactiveStorage()">Clean Temp</button>
+        <button class="ghost" onclick="clearHistory()">Clear</button>
+      </div>
     </div>
+    <div id="storageInfo" class="hist-meta" style="margin-top:8px;">Temp storage: checking...</div>
     <div id="historyList"><p style="margin:4px 0 0 0;">No transfers yet in this session.</p></div>
   </div>
 
@@ -1074,10 +2054,23 @@ async function sendFilesToPC(fileList) {
   if (res.ok) {
     showStatus(`${fileList.length} file(s) in Windows clipboard! Press Ctrl+V on PC.`);
     loadHistory();
+  } else {
+    showStatus('Upload failed (' + res.status + ').');
   }
 }
 
+async function loadStorageInfo() {
+  const res = await fetch(`/api/storage?key=${encodeURIComponent(KEY)}`);
+  if (!res.ok) return;
+  const st = await res.json();
+  const el = document.getElementById('storageInfo');
+  const activeCount = (st.protected_items || []).length;
+  const activeTxt = activeCount > 0 ? ` • ${activeCount} active on clipboard` : '';
+  el.textContent = `Temp: ${st.used_human} / ${st.quota_human} (TTL ${st.retention_minutes}m)${activeTxt}`;
+}
+
 async function loadHistory() {
+  loadStorageInfo();
   const res = await fetch(`/api/history?key=${encodeURIComponent(KEY)}`);
   if (!res.ok) return;
   const data = await res.json();
@@ -1093,7 +2086,7 @@ async function loadHistory() {
     const meta = document.createElement('div');
     meta.className = 'hist-meta';
     const dirSpan = document.createElement('span');
-    dirSpan.textContent = item.direction;
+    dirSpan.textContent = item.direction + (item.protected ? ' • Active' : '');
     const timeSpan = document.createElement('span');
     timeSpan.textContent = item.timestamp;
     meta.appendChild(dirSpan);
@@ -1128,8 +2121,35 @@ async function loadHistory() {
   });
 }
 
+async function cleanInactiveStorage() {
+  const res = await fetch(`/api/cleanup?key=${encodeURIComponent(KEY)}`, { method: 'POST' });
+  if (res.ok) {
+    const data = await res.json();
+    const parts = [`Cleaned ${data.reclaimed_human} (${data.reclaimed_count} item(s)).`];
+    if (data.warning) parts.push(data.warning);
+    showStatus(parts.join(' '));
+  }
+  loadHistory();
+}
+
 async function clearHistory() {
-  await fetch(`/api/history/clear?key=${encodeURIComponent(KEY)}`, { method: 'POST' });
+  const res = await fetch(`/api/history/clear?key=${encodeURIComponent(KEY)}`, { method: 'POST' });
+  if (res.ok) {
+    const data = await res.json();
+    if (data.preserved_active_count > 0) {
+      const ok = window.confirm(
+        `Warning: ${data.warning}\n\nPress OK to force-remove those active clipboard files too (Ctrl+V will stop working for them), or Cancel to keep them safe.`
+      );
+      if (ok) {
+        await fetch(`/api/history/clear?key=${encodeURIComponent(KEY)}&force=1`, { method: 'POST' });
+        showStatus('Cleared all history and active temporary files.');
+      } else {
+        showStatus(data.warning);
+      }
+    } else {
+      showStatus('Cleared session transfer history.');
+    }
+  }
   loadHistory();
 }
 
@@ -1148,34 +2168,57 @@ window.addEventListener('DOMContentLoaded', () => {
 # ==============================================================================
 # HTTP REQUEST HANDLER
 # ==============================================================================
+class ClipBridgeHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class ClipboardRequestHandler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.settimeout(REQUEST_TIMEOUT_SEC)
+        except OSError:
+            pass
+
     def end_headers(self):
-        # Do not expose bearer-key URLs via referrer headers; disable MIME sniffing.
+        # Do not expose bearer-key URLs via referrer headers; disable MIME sniffing and framing.
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
         super().end_headers()
 
     def log_message(self, format, *args):
         if sys.stdout and not sys.executable.lower().endswith("pythonw.exe"):
-            msg = re.sub(r"(key=)[^&\s]+", r"\1***", format % args)
+            msg = re.sub(r"([?&]key=)[^&\s\"']+", r"\1***", format % args)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {self.client_address[0]} - {msg}", flush=True)
 
     def _is_authorized(self) -> bool:
+        if not SECRET_KEY:
+            return False
         header_key = self.headers.get("X-Secret-Key", "").strip()
         parsed = urlparse(self.path)
         query_key = parse_qs(parsed.query).get("key", [""])[0].strip()
-        return secrets.compare_digest(header_key, SECRET_KEY) or secrets.compare_digest(query_key, SECRET_KEY)
+        header_ok = bool(header_key) and secrets.compare_digest(header_key, SECRET_KEY)
+        query_ok = bool(query_key) and secrets.compare_digest(query_key, SECRET_KEY)
+        return header_ok or query_ok
 
     def _send_json(self, status: int, payload: dict):
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _parse_content_length(self, max_bytes: int) -> int | None:
+        if "Transfer-Encoding" in self.headers and "Content-Length" not in self.headers:
+            self._send_json(411, {"status": "error", "message": "Content-Length header is required"})
+            return None
         raw_cl = self.headers.get("Content-Length", "0").strip()
         try:
             length = int(raw_cl)
@@ -1189,6 +2232,25 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"status": "error", "message": f"Payload exceeds limit of {format_size(max_bytes)}"})
             return None
         return length
+
+    def _read_optional_force_flag(self, parsed) -> bool:
+        query_force = parse_qs(parsed.query).get("force", [""])[0].strip().lower()
+        if query_force in {"1", "true", "yes"}:
+            return True
+        raw_cl = self.headers.get("Content-Length", "0").strip()
+        try:
+            length = int(raw_cl)
+        except ValueError:
+            return False
+        if 0 < length <= 4096:
+            try:
+                body = self.rfile.read(length).decode("utf-8", errors="replace")
+                data = json.loads(body)
+                if isinstance(data, dict):
+                    return bool(data.get("force", False))
+            except Exception:
+                pass
+        return False
 
     def do_GET(self):
         global CURRENT_PC_FILES
@@ -1226,13 +2288,20 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "items": HISTORY.list_items()})
             return
 
+        if route == "/api/storage":
+            self._send_json(200, HISTORY.get_storage_status())
+            return
+
         if route == "/api/pull":
             clip = WIN_BRIDGE.get_clipboard_content()
             if clip["type"] == "text":
                 HISTORY.add_text(clip["data"], "PC -> Phone")
                 self._send_json(200, {"type": "text", "content": clip["data"]})
             elif clip["type"] == "image":
-                HISTORY.add_files([clip["path"]], "PC -> Phone (Image)")
+                if clip.get("bytes"):
+                    HISTORY.add_image_bytes("pc_clipboard.png", clip["bytes"], "PC -> Phone (Image)")
+                else:
+                    HISTORY.add_files([clip["path"]], "PC -> Phone (Image)")
                 self._send_json(
                     200,
                     {
@@ -1242,10 +2311,12 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif clip["type"] == "files":
-                CURRENT_PC_FILES = clip["paths"]
-                HISTORY.add_files(CURRENT_PC_FILES, "PC -> Phone (Files)")
+                with PC_FILES_LOCK:
+                    CURRENT_PC_FILES = list(clip["paths"])
+                    pc_files = list(CURRENT_PC_FILES)
+                HISTORY.add_files(pc_files, "PC -> Phone (Files)")
                 file_entries = []
-                for idx, p in enumerate(CURRENT_PC_FILES):
+                for idx, p in enumerate(pc_files):
                     size_bytes = p.stat().st_size if p.exists() else 0
                     file_entries.append(
                         {
@@ -1270,8 +2341,10 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
 
         if route == "/api/pull-image":
             clip = WIN_BRIDGE.get_clipboard_content()
-            if clip["type"] == "image" and clip["path"].exists():
+            data = clip.get("bytes")
+            if data is None and clip["type"] == "image" and clip["path"].exists():
                 data = clip["path"].read_bytes()
+            if clip["type"] == "image" and data is not None:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Content-Length", str(len(data)))
@@ -1289,30 +2362,38 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
                 return
             idx = int(idx_str)
 
-            if not CURRENT_PC_FILES:
+            with PC_FILES_LOCK:
+                pc_files = list(CURRENT_PC_FILES)
+
+            if not pc_files:
                 clip = WIN_BRIDGE.get_clipboard_content()
                 if clip["type"] == "files":
-                    CURRENT_PC_FILES = clip["paths"]
+                    with PC_FILES_LOCK:
+                        CURRENT_PC_FILES = list(clip["paths"])
+                        pc_files = list(CURRENT_PC_FILES)
 
-            if idx < 0 or idx >= len(CURRENT_PC_FILES) or not CURRENT_PC_FILES[idx].is_file():
+            if idx < 0 or idx >= len(pc_files) or not pc_files[idx].is_file():
                 self._send_json(404, {"status": "error", "message": "File no longer in Windows clipboard"})
                 return
 
-            self._serve_file_attachment(CURRENT_PC_FILES[idx])
+            self._serve_file_attachment(pc_files[idx])
             return
 
         if route.startswith("/api/history-file/"):
             parts = route.split("/api/history-file/", 1)[1].split("/")
             if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-                target = HISTORY.get_file_path(int(parts[0]), int(parts[1]))
-                if target and target.is_file():
-                    self._serve_file_attachment(target)
+                target, tid = HISTORY.acquire_file_for_read(int(parts[0]), int(parts[1]))
+                if target:
+                    try:
+                        self._serve_file_attachment(target)
+                    finally:
+                        HISTORY.release_lease(tid)
                     return
             self._send_json(404, {"status": "error", "message": "History file not found"})
             return
 
         if route == "/api/save-latest":
-            saved_paths = save_staged_files_to_downloads()
+            saved_paths = save_staged_files_to_downloads(HISTORY)
             if saved_paths:
                 names = ", ".join(p.name for p in saved_paths)
                 WIN_BRIDGE.show_simple_toast("Saved to Downloads", f"Saved: {names}")
@@ -1326,19 +2407,28 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
     def _serve_file_attachment(self, target_file: Path):
         mime_type, _ = mimetypes.guess_type(str(target_file))
         mime_type = mime_type or "application/octet-stream"
-        file_size = target_file.stat().st_size
-        encoded_name = quote(target_file.name)
+        try:
+            file_size = target_file.stat().st_size
+            file_handle = target_file.open("rb")
+        except OSError:
+            self._send_json(404, {"status": "error", "message": "File unavailable"})
+            return
 
-        self.send_response(200)
-        self.send_header("Content-Type", mime_type)
-        self.send_header("Content-Length", str(file_size))
-        self.send_header(
-            "Content-Disposition",
-            f"attachment; filename=\"{target_file.name}\"; filename*=UTF-8''{encoded_name}",
-        )
-        self.end_headers()
-        with target_file.open("rb") as f:
-            shutil.copyfileobj(f, self.wfile, length=65536)
+        safe_ascii_name = target_file.name.replace('"', "_").replace("\r", "_").replace("\n", "_")
+        encoded_name = quote(target_file.name)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{safe_ascii_name}"; filename*=UTF-8\'\'{encoded_name}',
+            )
+            self.end_headers()
+            with file_handle:
+                shutil.copyfileobj(file_handle, self.wfile, length=65536)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
 
     def do_POST(self):
         if not self._is_authorized():
@@ -1349,16 +2439,32 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
         route = parsed.path
         content_type = self.headers.get("Content-Type", "")
 
+        if route == "/api/cleanup":
+            force = self._read_optional_force_flag(parsed)
+            result = HISTORY.cleanup(force=force, reclaim_inactive=True)
+            result["status"] = "ok"
+            self._send_json(200, result)
+            return
+
         if route == "/api/history/clear":
-            HISTORY.clear()
-            self._send_json(200, {"status": "ok"})
+            force = self._read_optional_force_flag(parsed)
+            result = HISTORY.clear(preserve_active=not force)
+            self._send_json(200, result)
             return
 
         if route == "/api/push-text":
             content_length = self._parse_content_length(MAX_TEXT_BYTES)
             if content_length is None:
                 return
-            raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+            try:
+                raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+            except (TimeoutError, OSError):
+                self._send_json(400, {"status": "error", "message": "Interrupted text payload"})
+                return
+            if len(raw_body) < content_length:
+                self._send_json(400, {"status": "error", "message": "Incomplete text payload"})
+                return
+
             text = raw_body.decode("utf-8", errors="replace")
             if "application/json" in content_type:
                 try:
@@ -1368,6 +2474,7 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
                     pass
             ok = WIN_BRIDGE.set_clipboard_text(text)
             if ok:
+                HISTORY.mark_clipboard_replaced()
                 HISTORY.add_text(text, "Phone -> PC")
             self._send_json(
                 200 if ok else 500,
@@ -1376,71 +2483,119 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
             return
 
         if route in {"/api/push-files", "/api/push-image"}:
-            content_length = self._parse_content_length(MAX_UPLOAD_BYTES)
+            effective_max = min(MAX_UPLOAD_BYTES, HISTORY.max_storage_bytes)
+            content_length = self._parse_content_length(effective_max)
             if content_length is None:
                 return
             if content_length == 0:
                 self._send_json(400, {"status": "error", "message": "Empty file payload"})
                 return
 
-            STAGED_DIR.mkdir(parents=True, exist_ok=True)
-            for old_file in STAGED_DIR.iterdir():
-                if old_file.is_file():
-                    try:
-                        old_file.unlink()
-                    except Exception:
-                        pass
-
-            staged_paths: list[Path] = []
-            if "multipart/form-data" in content_type and "boundary=" in content_type:
-                boundary_str = content_type.split("boundary=", 1)[1].split(";", 1)[0].strip().strip('"')
-                boundary = boundary_str.encode("ascii", errors="ignore")
-                staged_paths = stream_multipart_to_staged_dir(
-                    self.rfile, content_length, boundary, STAGED_DIR
-                )
-            else:
-                clean_ctype = content_type.split(";", 1)[0].strip().lower()
-                ext = mimetypes.guess_extension(clean_ctype) or ".png"
-                if clean_ctype in {"image/jpeg", "image/jpg"}:
-                    ext = ".jpg"
-                elif clean_ctype == "image/png":
-                    ext = ".png"
-                header_name = self.headers.get("X-File-Name", "").strip()
-                if header_name:
-                    filename = sanitize_filename(header_name, ext)
-                else:
-                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                    prefix = "Screenshot" if ext in IMAGE_EXTENSIONS else "File"
-                    filename = f"{prefix}_{timestamp}{ext}"
-                target = STAGED_DIR / filename
-                remaining = content_length
-                with target.open("wb") as out_f:
-                    while remaining > 0:
-                        chunk = self.rfile.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        out_f.write(chunk)
-                        remaining -= len(chunk)
-                if target.exists() and target.stat().st_size > 0:
-                    staged_paths.append(target)
-
-            if not staged_paths:
-                self._send_json(400, {"status": "error", "message": "No valid files parsed"})
+            try:
+                token, staging_dir = HISTORY.begin_upload(content_length)
+            except UploadBusyError as exc:
+                body = json.dumps({"status": "error", "message": str(exc)}).encode("utf-8")
+                try:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Retry-After", "2")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
 
-            ok = WIN_BRIDGE.set_clipboard_files_and_optional_image(staged_paths)
-            HISTORY.add_files(staged_paths, "Phone -> PC")
-            WIN_BRIDGE.show_incoming_files_toast_async(staged_paths)
+            committed = False
+            try:
+                staged_paths: list[Path] = []
+                if "multipart/form-data" in content_type and "boundary=" in content_type:
+                    boundary_str = content_type.split("boundary=", 1)[1].split(";", 1)[0].strip().strip('"')
+                    boundary = boundary_str.encode("ascii", errors="ignore")
+                    staged_paths = stream_multipart_to_staged_dir(
+                        self.rfile, content_length, boundary, staging_dir
+                    )
+                else:
+                    clean_ctype = content_type.split(";", 1)[0].strip().lower()
+                    ext = mimetypes.guess_extension(clean_ctype) or ".png"
+                    if clean_ctype in {"image/jpeg", "image/jpg"}:
+                        ext = ".jpg"
+                    elif clean_ctype == "image/png":
+                        ext = ".png"
+                    header_name = self.headers.get("X-File-Name", "").strip()
+                    if header_name:
+                        filename = sanitize_filename(header_name, ext)
+                    else:
+                        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        prefix = "Screenshot" if ext in IMAGE_EXTENSIONS else "File"
+                        filename = f"{prefix}_{timestamp}{ext}"
+                    target = staging_dir / filename
+                    if not _is_strict_subpath(target, staging_dir):
+                        raise IncompleteUploadError("Invalid target filename")
 
-            self._send_json(
-                200 if ok else 500,
-                {
-                    "status": "ok" if ok else "error",
-                    "count": len(staged_paths),
-                    "files": [p.name for p in staged_paths],
-                },
-            )
-            return
+                    remaining = content_length
+                    with target.open("wb") as out_f:
+                        while remaining > 0:
+                            chunk = self.rfile.read(min(65536, remaining))
+                            if not chunk:
+                                raise IncompleteUploadError("Raw upload interrupted before Content-Length bytes")
+                            out_f.write(chunk)
+                            remaining -= len(chunk)
+                    if target.exists() and target.stat().st_size > 0:
+                        staged_paths.append(target)
+
+                if not staged_paths:
+                    HISTORY.abort_upload(token, staging_dir)
+                    self._send_json(400, {"status": "error", "message": "No valid files parsed"})
+                    return
+
+                committed = True
+                tx_id, tx_paths, _, ok = HISTORY.commit_upload(
+                    token,
+                    staging_dir,
+                    staged_paths,
+                    "Phone -> PC",
+                    WIN_BRIDGE.set_clipboard_files_and_optional_image,
+                )
+                try:
+                    try:
+                        WIN_BRIDGE.show_incoming_files_toast_async(
+                            tx_paths, transfer_id=tx_id, history_store=HISTORY
+                        )
+                    except TypeError:
+                        WIN_BRIDGE.show_incoming_files_toast_async(tx_paths)
+                    self._send_json(
+                        200 if ok else 500,
+                        {
+                            "status": "ok" if ok else "error",
+                            "count": len(tx_paths),
+                            "files": [p.name for p in tx_paths],
+                        },
+                    )
+                finally:
+                    HISTORY.release_lease(tx_id)
+                return
+
+            except UploadLimitError as exc:
+                if not committed:
+                    HISTORY.abort_upload(token, staging_dir)
+                self._send_json(413, {"status": "error", "message": str(exc)})
+                return
+            except IncompleteUploadError as exc:
+                if not committed:
+                    HISTORY.abort_upload(token, staging_dir)
+                self._send_json(400, {"status": "error", "message": str(exc)})
+                return
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+                if not committed:
+                    HISTORY.abort_upload(token, staging_dir)
+                return
+            except Exception as exc:
+                if not committed:
+                    HISTORY.abort_upload(token, staging_dir)
+                self._send_json(500, {"status": "error", "message": f"Upload failed: {exc}"})
+                return
 
         self._send_json(404, {"status": "error", "message": "Unknown endpoint"})
 
@@ -1453,8 +2608,8 @@ def register_protocol_handler():
         return
     python_exe = Path(sys.executable)
     pythonw_exe = python_exe.with_name("pythonw.exe")
-    runner = str(pythonw_exe if pythonw_exe.exists() else python_exe)
-    script_path = str(Path(__file__).resolve())
+    runner = str(pythonw_exe if pythonw_exe.exists() else python_exe).replace("'", "''")
+    script_path = str(Path(__file__).resolve()).replace("'", "''")
 
     ps_reg = f"""
 $baseKey = 'HKCU:\\Software\\Classes\\clipbridge'
@@ -1483,16 +2638,44 @@ if (Test-Path 'HKCU:\\Software\\Classes\\clipbridge') {
 def handle_protocol_invocation(uri: str):
     uri_lower = uri.lower().strip().rstrip("/")
     if uri_lower.endswith("://save"):
-        saved = save_staged_files_to_downloads()
-        if saved and sys.platform == "win32":
-            if len(saved) == 1:
-                WIN_BRIDGE.show_simple_toast("Saved to Downloads", f"Saved as {saved[0].name}")
+        saved = save_staged_files_to_downloads(None)
+        if sys.platform == "win32":
+            if saved:
+                if len(saved) == 1:
+                    WIN_BRIDGE.show_simple_toast("Saved to Downloads", f"Saved as {saved[0].name}")
+                else:
+                    WIN_BRIDGE.show_simple_toast("Saved to Downloads", f"Saved {len(saved)} files to {SAVE_FOLDER}")
             else:
-                WIN_BRIDGE.show_simple_toast("Saved to Downloads", f"Saved {len(saved)} files to {SAVE_FOLDER}")
+                WIN_BRIDGE.show_simple_toast("Nothing to Save", "No staged ClipBridge files are currently available.")
     elif uri_lower.endswith("://open"):
         SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
             os.startfile(str(SAVE_FOLDER))
+
+
+def run_cli_cleanup(force: bool = False) -> dict:
+    """
+    Delegates non-destructive (or forced) cleanup to the live server if running,
+    or performs safe offline orphan cleanup while preserving active Windows clipboard files.
+    """
+    from urllib.request import Request, urlopen
+
+    url = f"http://127.0.0.1:{PORT}/api/cleanup"
+    body = json.dumps({"force": bool(force)}).encode("utf-8")
+    req = Request(
+        url,
+        data=body,
+        headers={
+            "X-Secret-Key": SECRET_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return HISTORY.cleanup_orphans_on_startup(force=force)
 
 
 def print_status_banner():
@@ -1504,6 +2687,7 @@ def print_status_banner():
     print("======================================================================")
     print(f"  Config File        : {CONFIG_PATH}")
     print(f"  Save Folder        : {SAVE_FOLDER}")
+    print(f"  Temp Storage Cap   : {format_size(MAX_STORAGE_BYTES)} (TTL {max(1, int(RETENTION_SECONDS // 60))} min)")
     print(f"  Local Server URL   : http://{local_ip}:{PORT}")
     print(f"  Secret Key         : {SECRET_KEY}")
     print("----------------------------------------------------------------------")
@@ -1525,18 +2709,48 @@ def main():
         print("Unregistered clipbridge:// protocol.")
         return
 
+    if len(sys.argv) >= 2 and sys.argv[1] in {"--cleanup", "--cleanup-force"}:
+        force = sys.argv[1] == "--cleanup-force"
+        result = run_cli_cleanup(force=force)
+        print(f"Reclaimed : {result.get('reclaimed_human', '0 B')} ({result.get('reclaimed_count', 0)} item(s))")
+        if result.get("warning"):
+            print(f"Warning   : {result['warning']}")
+        return
+
     register_protocol_handler()
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--register-only":
         print_status_banner()
         return
 
+    startup_res = HISTORY.cleanup_orphans_on_startup(force=False)
     print_status_banner()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), ClipboardRequestHandler)
+    if startup_res.get("reclaimed_count"):
+        print(
+            f"[Storage] Reclaimed {startup_res['reclaimed_human']} from previous session "
+            f"({startup_res['reclaimed_count']} orphaned item(s))."
+        )
+    if startup_res.get("warning"):
+        print(f"[Storage] {startup_res['warning']}")
+
+    stop_event = threading.Event()
+
+    def _maintenance_loop():
+        while not stop_event.wait(60):
+            try:
+                HISTORY.cleanup(force=False)
+            except Exception:
+                pass
+
+    threading.Thread(target=_maintenance_loop, daemon=True).start()
+    server = ClipBridgeHTTPServer(("0.0.0.0", PORT), ClipboardRequestHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        stop_event.set()
+        server.server_close()
 
 
 if __name__ == "__main__":

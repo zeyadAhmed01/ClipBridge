@@ -22,11 +22,17 @@ ClipBridge runs a multi-threaded HTTP server (`ThreadingHTTPServer`) on Windows 
 | `GET` | `/api/pull-image` | Yes | Returns PNG bytes of current Windows clipboard image |
 | `GET` | `/api/pull-file/<idx>` | Yes | Streams a copied Windows Explorer file as an attachment |
 | `GET` | `/api/history` | Yes | Returns recent session transfer history |
-| `GET` | `/api/history-file/<id>/<idx>` | Yes | Downloads a file from session history |
+| `GET` | `/api/history-file/<id>/<idx>` | Yes | Downloads a file from session history (lease-protected) |
+| `GET` | `/api/storage` | Yes | Returns temporary disk usage, quota, TTL, and active clipboard items |
+| `GET` | `/api/save-latest` | Yes | Copies latest staged transfer to `save_folder` (`Downloads`) |
 | `POST` | `/api/push-text` | Yes | Writes UTF-8 text (up to 2 MB) to Windows clipboard |
-| `POST` | `/api/push-files` | Yes | Streams multipart/raw files (up to `max_upload_mb`) to `%TEMP%\ClipBridge\staged` and sets Windows clipboard |
-| `POST` | `/api/history/clear` | Yes | Clears in-memory & staged session history |
+| `POST` | `/api/push-files` | Yes | Streams multipart/raw files into isolated staging dir, sets Windows clipboard, and dispatches Toast |
+| `POST` | `/api/cleanup` | Yes | Reclaims inactive/expired temp files (`force=true` removes active clipboard files too) |
+| `POST` | `/api/history/clear` | Yes | Non-destructive clear by default (preserves active clipboard files with warning unless `force=true`) |
 
-## Storage and concurrency caveats
+## Storage Lifecycle & Concurrency Isolation
 
-`TransferHistory.add_files()` creates local file copies under `%TEMP%\ClipBridge\history_files`. The UI's `max_history_items` limit bounds **in-memory entries**, not disk usage. Old copies can outlive a session or be orphaned by deque eviction. Concurrent uploads also reuse the shared `staged` directory. These limitations must be reviewed before a production-grade general release; see [release readiness](./RELEASE_READINESS.md).
+* **Isolated Per-Upload Staging**: Each `POST /api/push-files` or `/api/push-image` request reserves its payload size against `max_storage_mb` and streams chunks into a private `%TEMP%\ClipBridge\staged\.staging_<token>` directory. Truncated, malformed, or disconnected transfers immediately delete their `.staging_<token>` folder without affecting the Windows clipboard, `latest_transfer.json`, or concurrent uploads.
+* **Zero-Duplication Staging + History**: Completed uploads atomically rename `.staging_<token>` to `tx_<session>_<seq>_<token>` and update `latest_transfer.json` atomically. `TransferHistory` links directly to that directory for `Phone -> PC` transfers (avoiding duplicate disk writes), while `PC -> Phone` history copies are placed under session-scoped `%TEMP%\ClipBridge\history_files\s_<session>_item_<id>` only when within `max_storage_mb`.
+* **Active Clipboard & Operation Pinning**: Transfers hold reference leases during clipboard writes, background Toast threads, HTTP file downloads, and `Save to Downloads` copies. The latest clipboard transfer also records Windows `GetClipboardSequenceNumber()` and remains protected from automatic TTL/quota eviction until superseded or replaced on the clipboard.
+* **Deterministic Bounded Retention & Startup Recovery**: `TransferHistory` enforces `max_history_items` (`25`), `retention_minutes` (`60`), and total on-disk `max_storage_mb` (`1024`) across both `staged` and `history_files` (with a 60s background timer). On server startup, `cleanup_orphans_on_startup()` removes orphaned `.staging_*` and previous-session directories while adopting any staged folder still referenced by Windows `CF_HDROP`, and never deletes anything outside `%TEMP%\ClipBridge`.
