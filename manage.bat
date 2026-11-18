@@ -96,7 +96,7 @@ powershell.exe -NoProfile -NonInteractive -Command ^
   "$esc = [regex]::Escape($target); " ^
   "$q = [char]34; $sq = [char]39; " ^
   "$pat = '(?i)(?:^|\s|' + $q + '|' + $sq + ')' + $esc + '(?:' + $q + '|' + $sq + '|\s|$)'; " ^
-  "$procs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(?:python(?:w|3(?:\.\d+)?)?|pyw?)\.exe$' -and $_.CommandLine -and ($_.CommandLine -match $pat) -and ($_.CommandLine -notmatch '(?i)\s--(?:status|info|install-id|register-only|unregister|install-startup|uninstall-startup|uninstall-firewall|check-firewall|protocol|cleanup(?:-force)?)\b') }); " ^
+  "$procs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(?:python(?:w|3(?:\.\d+)?)?|pyw?)\.exe$' -and $_.CommandLine -and ($_.CommandLine -match $pat) -and ($_.CommandLine -notmatch '(?i)\s--(?:status|info|install-id|preflight-install|register-only|unregister|install-startup|uninstall-startup|uninstall-firewall|check-firewall|protocol|cleanup(?:-force)?)\b') }); " ^
   "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; " ^
   "if ($procs.Count -gt 0) { Wait-Process -Id ($procs.ProcessId) -Timeout 5 -ErrorAction SilentlyContinue }"
 exit /b 0
@@ -110,7 +110,7 @@ powershell.exe -NoProfile -NonInteractive -Command ^
   "$q = [char]34; $sq = [char]39; " ^
   "$pat = '(?i)(?:^|\s|' + $q + '|' + $sq + ')' + $esc + '(?:' + $q + '|' + $sq + '|\s|$)'; " ^
   "$port = [int]$env:CB_PORT; " ^
-  "$procs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(?:python(?:w|3(?:\.\d+)?)?|pyw?)\.exe$' -and $_.CommandLine -and ($_.CommandLine -match $pat) -and ($_.CommandLine -notmatch '(?i)\s--(?:status|info|install-id|register-only|unregister|install-startup|uninstall-startup|uninstall-firewall|check-firewall|protocol|cleanup(?:-force)?)\b') }); " ^
+  "$procs = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(?:python(?:w|3(?:\.\d+)?)?|pyw?)\.exe$' -and $_.CommandLine -and ($_.CommandLine -match $pat) -and ($_.CommandLine -notmatch '(?i)\s--(?:status|info|install-id|preflight-install|register-only|unregister|install-startup|uninstall-startup|uninstall-firewall|check-firewall|protocol|cleanup(?:-force)?)\b') }); " ^
   "if ($procs.Count -gt 0) { Write-Output ('RUNNING:' + ($procs[0].ProcessId)); exit 0 }; " ^
   "$listener = $null; " ^
   "try { $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}; " ^
@@ -133,9 +133,17 @@ if not "%CB_ELEVATED%"=="0" (
 )
 call :CHECK_PYTHON
 if errorlevel 1 goto MENU
+call :READ_PORT
 echo.
-echo [1/4] Stopping any existing ClipBridge instance for this installation...
+echo [1/4] Stopping any existing ClipBridge instance for this installation ^& checking for conflicts...
 call :STOP_PORT
+python "%PY_SCRIPT%" --preflight-install
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Installation aborted safely before modifying registry, Startup, or config.json.
+    pause
+    goto MENU
+)
 
 echo [2/4] Registering Windows Toast protocol ^& generating config.json...
 python "%PY_SCRIPT%" --register-only

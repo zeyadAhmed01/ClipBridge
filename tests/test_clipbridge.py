@@ -354,6 +354,7 @@ class TestClipBridgeUnit(unittest.TestCase):
         self.assertNotIn('for %%R in ("ClipBridge_%CB_PORT%" "ClipBridge_5050"', txt)
         # Issue 1, 2, 3 safety assertions:
         self.assertIn('python "%PY_SCRIPT%" --status', txt)
+        self.assertIn('python "%PY_SCRIPT%" --preflight-install', txt)
         self.assertIn('python "%PY_SCRIPT%" --install-startup', txt)
         self.assertIn('python "%PY_SCRIPT%" --uninstall-startup', txt)
         self.assertIn('python "%PY_SCRIPT%" --uninstall-firewall', txt)
@@ -362,6 +363,11 @@ class TestClipBridgeUnit(unittest.TestCase):
         self.assertNotIn("ClipboardBridge_5050", txt)
         status_block = txt.split(":STATUS", 1)[1].split(":RESTART", 1)[0]
         self.assertNotIn("--register-only", status_block)
+        install_block = txt.split(":INSTALL", 1)[1].split(":STATUS", 1)[0]
+        self.assertLess(
+            install_block.index('python "%PY_SCRIPT%" --preflight-install'),
+            install_block.index('python "%PY_SCRIPT%" --register-only'),
+        )
 
     def test_failed_clipboard_adapter_does_not_strand_storage_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -387,25 +393,47 @@ class TestClipBridgeUnit(unittest.TestCase):
             self.assertTrue(all(rec["leases"] == 0 for rec in history._transfers.values()))
 
     def test_cli_status_and_info_are_strictly_readonly(self):
-        buf = io.StringIO()
-        with (
-            patch.object(cb, "register_protocol_handler") as mock_reg,
-            patch.object(cb, "unregister_protocol_handler") as mock_unreg,
-            patch.object(cb, "install_startup_launcher") as mock_startup,
-            patch.object(cb, "get_protocol_status", return_value={"registered": False, "command": None, "target_script": None, "owned_by_current": False}),
-            patch.object(cb.HISTORY, "cleanup_orphans_on_startup") as mock_clean,
-            patch.object(cb, "ClipBridgeHTTPServer") as mock_srv,
-            patch("sys.stdout", buf),
-        ):
-            rc1 = cb.main(["--status"])
-            rc2 = cb.main(["--info"])
-        self.assertEqual(rc1, 0)
-        self.assertEqual(rc2, 0)
-        mock_reg.assert_not_called()
-        mock_unreg.assert_not_called()
-        mock_startup.assert_not_called()
-        mock_clean.assert_not_called()
-        mock_srv.assert_not_called()
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_cfg = Path(tmp) / "missing_config.json"
+            buf = io.StringIO()
+            with (
+                patch.object(cb, "CONFIG_PATH", missing_cfg),
+                patch.object(cb, "SECRET_KEY", "unsaved-ephemeral-secret-999"),
+                patch.object(cb, "register_protocol_handler") as mock_reg,
+                patch.object(cb, "unregister_protocol_handler") as mock_unreg,
+                patch.object(cb, "install_startup_launcher") as mock_startup,
+                patch.object(cb, "get_protocol_status", return_value={"registered": False, "command": None, "target_script": None, "owned_by_current": False}),
+                patch.object(cb.HISTORY, "cleanup_orphans_on_startup") as mock_clean,
+                patch.object(cb, "ClipBridgeHTTPServer") as mock_srv,
+                patch("sys.stdout", buf),
+            ):
+                rc1 = cb.main(["--status"])
+                rc2 = cb.main(["--info"])
+            self.assertEqual(rc1, 0)
+            self.assertEqual(rc2, 0)
+            self.assertFalse(missing_cfg.exists())
+            out = buf.getvalue()
+            self.assertIn("Not configured yet", out)
+            self.assertIn("<generated-on-install>", out)
+            self.assertNotIn("unsaved-ephemeral-secret-999", out)
+            mock_reg.assert_not_called()
+            mock_unreg.assert_not_called()
+            mock_startup.assert_not_called()
+            mock_clean.assert_not_called()
+            mock_srv.assert_not_called()
+
+            # When config.json exists with a persisted secret_key, read-only status shows it without modifying disk.
+            saved_cfg = Path(tmp) / "saved_config.json"
+            saved_cfg.write_text(json.dumps({"port": 5050, "secret_key": "clip-persisted-test-key"}), encoding="utf-8")
+            buf_saved = io.StringIO()
+            with (
+                patch.object(cb, "CONFIG_PATH", saved_cfg),
+                patch.object(cb, "SECRET_KEY", "clip-persisted-test-key"),
+                patch.object(cb, "get_protocol_status", return_value={"registered": False, "command": None, "target_script": None, "owned_by_current": False}),
+                patch("sys.stdout", buf_saved),
+            ):
+                self.assertEqual(cb.main(["--status"]), 0)
+            self.assertIn("clip-persisted-test-key", buf_saved.getvalue())
 
     def test_normal_startup_and_malformed_args_never_register_protocol(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -428,6 +456,7 @@ class TestClipBridgeUnit(unittest.TestCase):
                     return
 
             with (
+                patch.object(cb, "CONFIG_PATH", root / "config.json"),
                 patch.object(cb, "HISTORY", hist),
                 patch.object(cb, "register_protocol_handler") as mock_reg,
                 patch.object(cb, "ClipBridgeHTTPServer", _FakeServer),
@@ -744,6 +773,126 @@ class TestClipBridgeUnit(unittest.TestCase):
             self.assertEqual(res_unowned["reason"], "ownership_unverified")
             self.assertTrue((foreign_tx / "foreign.txt").exists())
             self.assertTrue((legacy_item / "legacy.bin").exists())
+
+    def test_cli_cleanup_holds_exclusive_lock_across_critical_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script_a = root / "InstA" / "clipboard_bridge.py"
+            script_a.parent.mkdir()
+            script_a.write_text("# a", encoding="utf-8")
+            id_a = cb.compute_install_id(script_a)
+            temp_dir = root / "temp_a"
+            hist = cb.TransferHistory(
+                maxlen=5,
+                staged_dir=temp_dir / "staged",
+                history_files_dir=temp_dir / "history_files",
+                temp_dir=temp_dir,
+                install_id=id_a,
+                script_path=script_a,
+                get_clipboard_files_fn=lambda: [],
+            )
+            hist.ensure_storage_ownership()
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                closed_port = probe.getsockname()[1]
+
+            in_critical_section = threading.Event()
+            resume_cleanup = threading.Event()
+            concurrent_lock_results: list[str] = []
+
+            orig_cleanup = hist.cleanup_orphans_on_startup
+
+            def hooked_cleanup(*args, **kwargs):
+                in_critical_section.set()
+                resume_cleanup.wait(timeout=5)
+                return orig_cleanup(*args, **kwargs)
+
+            def run_cleanup_worker():
+                with (
+                    patch.object(cb, "_is_port_listening", return_value=False),
+                    patch.object(cb, "_verify_no_running_clipbridge_process", return_value=(True, "verified_stopped")),
+                    patch.object(hist, "cleanup_orphans_on_startup", side_effect=hooked_cleanup),
+                ):
+                    return cb.run_cli_cleanup(force=False, history_store=hist, port=closed_port, secret_key="k")
+
+            worker_out: list[dict] = []
+            t = threading.Thread(target=lambda: worker_out.append(run_cleanup_worker()), daemon=True)
+            t.start()
+            self.assertTrue(in_critical_section.wait(timeout=5))
+
+            # While offline cleanup is inside its critical section, another server cannot acquire .server.lock.
+            with self.assertRaises(RuntimeError):
+                cb.acquire_server_lock(temp_dir, closed_port, id_a, script_a)
+            concurrent_lock_results.append("blocked_while_cleaning")
+
+            resume_cleanup.set()
+            t.join(timeout=5)
+            self.assertEqual(len(worker_out), 1)
+            self.assertEqual(worker_out[0]["status"], "ok")
+            self.assertEqual(concurrent_lock_results, ["blocked_while_cleaning"])
+
+            # Once offline cleanup exits, the lock is reliably released.
+            fh = cb.acquire_server_lock(temp_dir, closed_port, id_a, script_a)
+            cb.release_server_lock(fh)
+
+    def test_install_preflight_blocks_foreign_port_protocol_and_startup_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script_a = root / "InstA" / "clipboard_bridge.py"
+            script_b = root / "InstB" / "clipboard_bridge.py"
+            startup_dir = root / "Startup"
+            script_a.parent.mkdir()
+            script_b.parent.mkdir()
+            startup_dir.mkdir()
+            script_a.write_text("# a", encoding="utf-8")
+            script_b.write_text("# b", encoding="utf-8")
+
+            # 1. Clean environment -> preflight passes
+            with (
+                patch.object(cb, "_is_port_listening", return_value=False),
+                patch.object(cb, "get_protocol_status", return_value={"registered": False, "command": None, "target_script": None, "owned_by_current": False}),
+            ):
+                res_ok = cb.run_install_preflight(5050, script_a, startup_dir)
+            self.assertTrue(res_ok["ok"])
+            self.assertEqual(res_ok["conflicts"], [])
+
+            # 2. Owned protocol + owned startup launcher + free port -> preflight passes (idempotent reinstall)
+            cb.install_startup_launcher(startup_dir, script_a, runner="C:\\Python\\pythonw.exe")
+            with (
+                patch.object(cb, "_is_port_listening", return_value=False),
+                patch.object(cb, "get_protocol_status", return_value={"registered": True, "command": f'"C:\\Python\\pythonw.exe" "{script_a}" --protocol "%1"', "target_script": str(script_a), "owned_by_current": True}),
+            ):
+                res_reinstall = cb.run_install_preflight(5050, script_a, startup_dir)
+            self.assertTrue(res_reinstall["ok"])
+
+            # 3. Port occupied + foreign protocol + legacy startup + foreign startup -> all reported, preflight fails
+            (startup_dir / "ClipboardBridge_SilentStartup.vbs").write_text('CreateObject("WScript.Shell").Run "old.py"', encoding="utf-8")
+            cb.install_startup_launcher(startup_dir, script_b, runner="C:\\Python\\pythonw.exe")
+            with (
+                patch.object(cb, "_is_port_listening", return_value=True),
+                patch.object(cb, "get_protocol_status", return_value={"registered": True, "command": f'"C:\\Python\\pythonw.exe" "{script_b}" --protocol "%1"', "target_script": str(script_b), "owned_by_current": False}),
+            ):
+                res_conflict = cb.run_install_preflight(5050, script_a, startup_dir)
+            self.assertFalse(res_conflict["ok"])
+            kinds = {c["kind"] for c in res_conflict["conflicts"]}
+            self.assertEqual(kinds, {"port_occupied", "foreign_protocol", "legacy_startup", "foreign_startup"})
+
+            # 4. CLI --preflight-install returns 1 on conflict and 0 when clean, without registering protocol
+            with (
+                patch.object(cb, "run_install_preflight", return_value=res_conflict),
+                patch.object(cb, "register_protocol_handler") as mock_reg,
+                patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(cb.main(["--preflight-install"]), 1)
+                mock_reg.assert_not_called()
+            with (
+                patch.object(cb, "run_install_preflight", return_value=res_ok),
+                patch.object(cb, "register_protocol_handler") as mock_reg,
+                patch("sys.stdout", io.StringIO()),
+            ):
+                self.assertEqual(cb.main(["--preflight-install"]), 0)
+                mock_reg.assert_not_called()
 
 
 class TestClipBridgeHTTP(unittest.TestCase):

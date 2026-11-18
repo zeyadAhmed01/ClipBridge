@@ -137,10 +137,43 @@ def load_or_create_config(read_only: bool = False) -> dict:
     return default_cfg
 
 
-_CLI_READONLY_MODES = {"--status", "--info", "--install-id", "--unregister", "--uninstall-startup", "--uninstall-firewall", "--check-firewall", "--cleanup", "--cleanup-force"}
-_IS_READONLY_CLI = len(sys.argv) >= 2 and sys.argv[1] in _CLI_READONLY_MODES
+def _has_persisted_config(config_path: Path | None = None) -> bool:
+    target = config_path or CONFIG_PATH
+    if not target.is_file():
+        return False
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        key_val = str(data.get("secret_key") or "").strip()
+        return bool(key_val and key_val != "replace-with-your-secret-key")
+    except Exception:
+        return False
 
-CONFIG = load_or_create_config(read_only=_IS_READONLY_CLI)
+
+def ensure_config_persisted(config_path: Path | None = None) -> dict:
+    target = config_path or CONFIG_PATH
+    if _has_persisted_config(target):
+        return CONFIG
+    payload = {
+        "port": PORT,
+        "secret_key": SECRET_KEY,
+        "save_folder": str(SAVE_FOLDER),
+        "max_history_items": MAX_HISTORY,
+        "max_upload_mb": max(1, int(MAX_UPLOAD_BYTES // (1024 * 1024))),
+        "max_storage_mb": max(1, int(MAX_STORAGE_BYTES // (1024 * 1024))),
+        "retention_minutes": max(1, int(RETENTION_SECONDS // 60)),
+    }
+    try:
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return payload
+
+
+# Never write config.json as a module-import or read-only CLI side effect;
+# ensure_config_persisted() writes config.json only during --register-only or server startup.
+CONFIG = load_or_create_config(read_only=True)
 PORT = _safe_int(CONFIG.get("port"), 5050, 1, 65535)
 SECRET_KEY = str(CONFIG.get("secret_key") or "").strip() or f"clip-{secrets.token_hex(16)}"
 SAVE_FOLDER = Path(CONFIG.get("save_folder") or str(Path.home() / "Downloads"))
@@ -2760,6 +2793,7 @@ _HELPER_CLI_FLAGS = (
     "--status",
     "--info",
     "--install-id",
+    "--preflight-install",
     "--register-only",
     "--unregister",
     "--install-startup",
@@ -3236,6 +3270,17 @@ def release_server_lock(fh):
             pass
 
 
+def acquire_cleanup_lock(temp_dir: Path):
+    if not temp_dir.is_dir():
+        return None
+    lock_path = temp_dir / ".server.lock"
+    fh = lock_path.open("a+", encoding="utf-8")
+    if not _lock_file_nonblocking(fh):
+        fh.close()
+        raise RuntimeError(f"Another ClipBridge instance for this installation already holds {lock_path}")
+    return fh
+
+
 def is_server_lock_held(temp_dir: Path) -> bool:
     lock_path = temp_dir / ".server.lock"
     if not lock_path.exists():
@@ -3494,39 +3539,140 @@ def run_cli_cleanup(
         if not _is_connection_refused(exc):
             return _aborted_cleanup("network_error", f"Could not verify port {target_port} ({exc}); offline cleanup aborted.")
 
-    # Only reached on confirmed ConnectionRefusedError: fail closed unless all safety checks pass.
-    port_listening = _is_port_listening(target_port)
-    if port_listening is True:
-        return _aborted_cleanup("port_occupied", f"Port {target_port} is occupied by another listener; offline cleanup aborted.")
-    if port_listening is None:
-        return _aborted_cleanup("port_unverifiable", f"Could not verify whether port {target_port} is free; offline cleanup aborted.")
-
-    if is_server_lock_held(store.temp_dir):
+    # Only reached on confirmed ConnectionRefusedError: acquire the installation lock across the
+    # entire offline cleanup critical section and recheck all invariants under the held lock.
+    lock_file_path = store.temp_dir / ".server.lock"
+    lock_existed_before = lock_file_path.exists()
+    try:
+        lock_fh = acquire_cleanup_lock(store.temp_dir)
+    except Exception:
         return _aborted_cleanup("server_lock_held", "Active ClipBridge server lock detected; offline cleanup aborted.")
 
-    proc_ok, proc_msg = _verify_no_running_clipbridge_process(store.script_path)
-    if not proc_ok:
-        return _aborted_cleanup("process_unverifiable", proc_msg)
+    cleanup_owner_verified = False
+    try:
+        port_listening = _is_port_listening(target_port)
+        if port_listening is True:
+            return _aborted_cleanup("port_occupied", f"Port {target_port} is occupied by another listener; offline cleanup aborted.")
+        if port_listening is None:
+            return _aborted_cleanup("port_unverifiable", f"Could not verify whether port {target_port} is free; offline cleanup aborted.")
 
-    owner_ok, owner_msg = store.verify_storage_ownership()
-    if not owner_ok:
-        return _aborted_cleanup(
-            "ownership_unverified",
-            f"Storage ownership could not be verified ({owner_msg}); offline cleanup refused.",
+        proc_ok, proc_msg = _verify_no_running_clipbridge_process(store.script_path)
+        if not proc_ok:
+            return _aborted_cleanup("process_unverifiable", proc_msg)
+
+        owner_ok, owner_msg = store.verify_storage_ownership()
+        if not owner_ok:
+            return _aborted_cleanup(
+                "ownership_unverified",
+                f"Storage ownership could not be verified ({owner_msg}); offline cleanup refused.",
+            )
+        cleanup_owner_verified = True
+
+        return store.cleanup_orphans_on_startup(force=force, require_verified_owner=True)
+    finally:
+        release_server_lock(lock_fh)
+        if lock_fh is not None and not lock_existed_before and not cleanup_owner_verified:
+            try:
+                lock_file_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def run_install_preflight(
+    port: int | None = None,
+    script_path: Path | None = None,
+    startup_dir: Path | None = None,
+) -> dict:
+    """
+    Non-destructive preflight before installation (`manage.bat` option [1]):
+    Detects whether another application or foreign/legacy ClipBridge installation
+    occupies the target TCP port, owns `clipbridge://`, or has a legacy/foreign
+    startup launcher before mutating registry, startup, or config.json.
+    """
+    target_script = (script_path or SCRIPT_PATH).resolve()
+    target_port = PORT if port is None else int(port)
+    sdir = startup_dir or get_startup_dir()
+    conflicts: list[dict] = []
+
+    port_state = _is_port_listening(target_port)
+    if port_state is True:
+        conflicts.append(
+            {
+                "kind": "port_occupied",
+                "message": f"TCP port {target_port} is already in use by another running process or legacy ClipBridge instance.",
+            }
+        )
+    elif port_state is None:
+        conflicts.append(
+            {
+                "kind": "port_unverifiable",
+                "message": f"Could not verify whether TCP port {target_port} is free (failing closed).",
+            }
         )
 
-    return store.cleanup_orphans_on_startup(force=force, require_verified_owner=True)
+    proto = get_protocol_status(target_script)
+    if proto.get("registered") and not proto.get("owned_by_current"):
+        owner_desc = proto.get("target_script") or proto.get("command") or "unknown installation"
+        conflicts.append(
+            {
+                "kind": "foreign_protocol",
+                "owner": owner_desc,
+                "message": f"Protocol handler clipbridge:// is currently registered to another installation ({owner_desc}).",
+            }
+        )
+
+    if sdir.is_dir():
+        legacy_vbs = sdir / "ClipboardBridge_SilentStartup.vbs"
+        if legacy_vbs.exists():
+            conflicts.append(
+                {
+                    "kind": "legacy_startup",
+                    "launcher": legacy_vbs.name,
+                    "message": f"Legacy startup launcher '{legacy_vbs.name}' exists in Windows Startup ({sdir}).",
+                }
+            )
+        for cand in sorted(sdir.glob("ClipBridge*.vbs")):
+            if not is_startup_launcher_owned(cand, target_script):
+                conflicts.append(
+                    {
+                        "kind": "foreign_startup",
+                        "launcher": cand.name,
+                        "message": f"Startup launcher '{cand.name}' belongs to another ClipBridge installation.",
+                    }
+                )
+
+    return {
+        "ok": len(conflicts) == 0,
+        "status": "ok" if len(conflicts) == 0 else "conflict",
+        "port": target_port,
+        "script_path": str(target_script),
+        "conflicts": conflicts,
+    }
 
 
-def print_status_banner(include_protocol: bool = False):
+def print_status_banner(
+    include_protocol: bool = False,
+    read_only: bool = False,
+    config_path: Path | None = None,
+):
+    cfg_path = config_path or CONFIG_PATH
+    configured = (not read_only) or _has_persisted_config(cfg_path)
     local_ip = get_local_ip()
-    web_url = f"http://{local_ip}:{PORT}/?key={SECRET_KEY}"
-    import_url = f"http://{local_ip}:{PORT}/setup/shortcuts.json?key={SECRET_KEY}"
+    if configured:
+        cfg_display = str(cfg_path)
+        key_display = SECRET_KEY
+        web_url = f"http://{local_ip}:{PORT}/?key={SECRET_KEY}"
+        import_url = f"http://{local_ip}:{PORT}/setup/shortcuts.json?key={SECRET_KEY}"
+    else:
+        cfg_display = f"{cfg_path} (not created yet)"
+        key_display = "[Not configured yet — run manage.bat option [1] to generate config.json]"
+        web_url = f"http://{local_ip}:{PORT}/?key=<generated-on-install>"
+        import_url = f"http://{local_ip}:{PORT}/setup/shortcuts.json?key=<generated-on-install>"
     print("======================================================================")
     print(f"  ClipBridge v{VERSION} — By Zeyad Ahmed")
     print("======================================================================")
     print(f"  Install ID         : {INSTALL_ID}")
-    print(f"  Config File        : {CONFIG_PATH}")
+    print(f"  Config File        : {cfg_display}")
     print(f"  Save Folder        : {SAVE_FOLDER}")
     print(f"  Temp Storage Dir   : {TEMP_DIR}")
     print(f"  Temp Storage Cap   : {format_size(MAX_STORAGE_BYTES)} (TTL {max(1, int(RETENTION_SECONDS // 60))} min)")
@@ -3540,7 +3686,7 @@ def print_status_banner(include_protocol: bool = False):
             proto_desc = f"Registered to another installation ({proto['target_script'] or 'unknown'})"
         print(f"  Protocol Handler   : {proto_desc}")
     print(f"  Local Server URL   : http://{local_ip}:{PORT}")
-    print(f"  Secret Key         : {SECRET_KEY}")
+    print(f"  Secret Key         : {key_display}")
     print("----------------------------------------------------------------------")
     print("  1-Click Android 'Import from URL' (Paste in HTTP Shortcuts):")
     print(f"  {import_url}")
@@ -3558,18 +3704,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if len(args) == 1 and args[0] in {"--status", "--info"}:
-        print_status_banner(include_protocol=True)
+        print_status_banner(include_protocol=True, read_only=True)
         return 0
 
     if len(args) == 1 and args[0] == "--install-id":
         print(INSTALL_ID)
         return 0
 
+    if len(args) == 1 and args[0] == "--preflight-install":
+        res = run_install_preflight(PORT, SCRIPT_PATH)
+        if not res["ok"]:
+            print("[ABORTED] Installation preflight detected an existing installation or port conflict:")
+            for item in res["conflicts"]:
+                print(f"  - {item['message']}")
+            print("  Migration guidance: Stop and uninstall the older/foreign ClipBridge installation")
+            print("  (or free the configured port and remove foreign clipbridge:// / Startup entries)")
+            print("  before running option [1]. Existing installations were left untouched.")
+            return 1
+        print(f"[OK] Installation preflight passed (port {res['port']} free, no foreign integration conflicts).")
+        return 0
+
     if len(args) == 1 and args[0] == "--register-only":
+        ensure_config_persisted()
         reg_res = register_protocol_handler(SCRIPT_PATH)
         if reg_res.get("replaced_foreign"):
             print(f"[Protocol] Updated clipbridge:// from previous target ({reg_res.get('previous_target')}).")
-        print_status_banner(include_protocol=True)
+        print_status_banner(include_protocol=True, read_only=False)
         return 0
 
     if len(args) == 1 and args[0] == "--unregister":
@@ -3628,6 +3788,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # Normal server mode: never auto-register clipbridge:// protocol!
+    ensure_config_persisted()
     HISTORY.ensure_storage_ownership()
     lock_fh = acquire_server_lock(HISTORY.temp_dir, PORT, INSTALL_ID, SCRIPT_PATH)
     try:
