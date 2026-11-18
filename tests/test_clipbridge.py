@@ -352,6 +352,16 @@ class TestClipBridgeUnit(unittest.TestCase):
         self.assertIn('if "%CHOICE%"=="7" goto FIREWALL', txt)
         self.assertIn("No server was started with elevated privileges", txt)
         self.assertNotIn('for %%R in ("ClipBridge_%CB_PORT%" "ClipBridge_5050"', txt)
+        # Issue 1, 2, 3 safety assertions:
+        self.assertIn('python "%PY_SCRIPT%" --status', txt)
+        self.assertIn('python "%PY_SCRIPT%" --install-startup', txt)
+        self.assertIn('python "%PY_SCRIPT%" --uninstall-startup', txt)
+        self.assertIn('python "%PY_SCRIPT%" --uninstall-firewall', txt)
+        self.assertIn('python "%PY_SCRIPT%" --check-firewall', txt)
+        self.assertNotIn("ClipboardBridge_SilentStartup.vbs", txt)
+        self.assertNotIn("ClipboardBridge_5050", txt)
+        status_block = txt.split(":STATUS", 1)[1].split(":RESTART", 1)[0]
+        self.assertNotIn("--register-only", status_block)
 
     def test_failed_clipboard_adapter_does_not_strand_storage_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -376,28 +386,364 @@ class TestClipBridgeUnit(unittest.TestCase):
             self.assertFalse(history._inflight_uploads)
             self.assertTrue(all(rec["leases"] == 0 for rec in history._transfers.values()))
 
-    def test_run_cli_cleanup_offline_fallback(self):
+    def test_cli_status_and_info_are_strictly_readonly(self):
+        buf = io.StringIO()
+        with (
+            patch.object(cb, "register_protocol_handler") as mock_reg,
+            patch.object(cb, "unregister_protocol_handler") as mock_unreg,
+            patch.object(cb, "install_startup_launcher") as mock_startup,
+            patch.object(cb, "get_protocol_status", return_value={"registered": False, "command": None, "target_script": None, "owned_by_current": False}),
+            patch.object(cb.HISTORY, "cleanup_orphans_on_startup") as mock_clean,
+            patch.object(cb, "ClipBridgeHTTPServer") as mock_srv,
+            patch("sys.stdout", buf),
+        ):
+            rc1 = cb.main(["--status"])
+            rc2 = cb.main(["--info"])
+        self.assertEqual(rc1, 0)
+        self.assertEqual(rc2, 0)
+        mock_reg.assert_not_called()
+        mock_unreg.assert_not_called()
+        mock_startup.assert_not_called()
+        mock_clean.assert_not_called()
+        mock_srv.assert_not_called()
+
+    def test_normal_startup_and_malformed_args_never_register_protocol(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            staged = root / "staged"
-            history_dir = root / "history"
-            staged.mkdir()
-            history_dir.mkdir()
-            orphan = staged / ".staging_abandoned"
-            orphan.mkdir()
-            (orphan / "part.bin").write_bytes(b"12345")
-
             hist = cb.TransferHistory(
-                maxlen=5,
-                staged_dir=staged,
-                history_files_dir=history_dir,
+                staged_dir=root / "staged",
+                history_files_dir=root / "history",
                 temp_dir=root,
                 get_clipboard_files_fn=lambda: [],
             )
-            with patch.object(cb, "PORT", 1), patch.object(cb, "HISTORY", hist):
-                res = cb.run_cli_cleanup(force=False)
-            self.assertEqual(res["status"], "ok")
-            self.assertFalse(orphan.exists())
+
+            class _FakeServer:
+                def __init__(self, *_a, **_kw):
+                    pass
+
+                def serve_forever(self):
+                    return
+
+                def server_close(self):
+                    return
+
+            with (
+                patch.object(cb, "HISTORY", hist),
+                patch.object(cb, "register_protocol_handler") as mock_reg,
+                patch.object(cb, "ClipBridgeHTTPServer", _FakeServer),
+                patch("sys.stdout", io.StringIO()),
+                patch("sys.stderr", io.StringIO()),
+            ):
+                # Normal server invocation must NOT auto-register protocol.
+                self.assertEqual(cb.main([]), 0)
+                mock_reg.assert_not_called()
+
+                # Malformed arguments fail closed with exit code 2 and zero side effects.
+                self.assertEqual(cb.main(["--unknown-flag"]), 2)
+                self.assertEqual(cb.main(["--protocol"]), 2)
+                self.assertEqual(cb.main(["--status", "extra"]), 2)
+                mock_reg.assert_not_called()
+
+                # Explicit registration is the only path that calls register_protocol_handler.
+                self.assertEqual(cb.main(["--register-only"]), 0)
+                mock_reg.assert_called_once()
+
+    def test_protocol_ownership_parsing_and_uninstall_protection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install_a = root / "Copy A & (v1)" / "clipboard_bridge.py"
+            install_b = root / "Copy B" / "clipboard_bridge.py"
+            install_a.parent.mkdir(parents=True)
+            install_b.parent.mkdir(parents=True)
+            install_a.write_text("# a", encoding="utf-8")
+            install_b.write_text("# b", encoding="utf-8")
+
+            cmd_a = f'"C:\\Python\\pythonw.exe" "{install_a}" --protocol "%1"'
+            cmd_b = f'"C:\\Python\\pythonw.exe" "{install_b}" --protocol "%1"'
+            self.assertTrue(cb.is_protocol_command_owned(cmd_a, install_a))
+            self.assertFalse(cb.is_protocol_command_owned(cmd_b, install_a))
+            self.assertFalse(cb.is_protocol_command_owned("malformed 'unclosed", install_a))
+            self.assertFalse(cb.is_protocol_command_owned("", install_a))
+
+            if sys.platform == "win32":
+                import winreg
+
+                # Foreign protocol owner must NOT be deleted.
+                with (
+                    patch.object(cb, "get_protocol_status", return_value={
+                        "registered": True,
+                        "command": cmd_b,
+                        "target_script": str(install_b),
+                        "owned_by_current": False,
+                    }),
+                    patch.object(winreg, "DeleteKey") as mock_del,
+                ):
+                    res_skip = cb.unregister_protocol_handler(install_a)
+                self.assertEqual(res_skip["status"], "skipped")
+                self.assertFalse(res_skip["removed"])
+                mock_del.assert_not_called()
+
+                # Owned protocol removes cleanly and repeats idempotently.
+                with (
+                    patch.object(cb, "get_protocol_status", return_value={
+                        "registered": True,
+                        "command": cmd_a,
+                        "target_script": str(install_a),
+                        "owned_by_current": True,
+                    }),
+                    patch.object(winreg, "DeleteKey") as mock_del,
+                ):
+                    res_ok = cb.unregister_protocol_handler(install_a)
+                self.assertEqual(res_ok["status"], "removed")
+                self.assertTrue(res_ok["removed"])
+                self.assertEqual(mock_del.call_count, 4)
+
+                with patch.object(cb, "get_protocol_status", return_value={
+                    "registered": False,
+                    "command": None,
+                    "target_script": None,
+                    "owned_by_current": False,
+                }):
+                    res_absent = cb.unregister_protocol_handler(install_a)
+                self.assertEqual(res_absent["status"], "absent")
+                self.assertFalse(res_absent["removed"])
+
+    def test_startup_launcher_ownership_and_idempotent_uninstall(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            startup = root / "Startup"
+            startup.mkdir()
+            install_a = root / "Install A & (Special)" / "clipboard_bridge.py"
+            install_b = root / "Install B" / "clipboard_bridge.py"
+            install_a.parent.mkdir()
+            install_b.parent.mkdir()
+            install_a.write_text("# a", encoding="utf-8")
+            install_b.write_text("# b", encoding="utf-8")
+
+            vbs_a = cb.install_startup_launcher(startup, install_a, Path("C:/Python/pythonw.exe"))
+            vbs_b = cb.install_startup_launcher(startup, install_b, Path("C:/Python/pythonw.exe"))
+            legacy_vbs = startup / "ClipboardBridge_SilentStartup.vbs"
+            legacy_vbs.write_text('WshShell.Run "python ""D:\\ClipboardBridge\\clipboard_bridge.py""", 0, False', encoding="utf-8")
+            shared_foreign = startup / "ClipBridge_SilentStartup.vbs"
+            shared_foreign.write_text(f'WshShell.Run "python ""{install_b}""", 0, False', encoding="utf-8")
+
+            self.assertTrue(cb.is_startup_launcher_owned(vbs_a, install_a))
+            self.assertFalse(cb.is_startup_launcher_owned(vbs_b, install_a))
+            self.assertFalse(cb.is_startup_launcher_owned(legacy_vbs, install_a))
+            self.assertFalse(cb.is_startup_launcher_owned(shared_foreign, install_a))
+
+            res1 = cb.uninstall_startup_launchers(startup, install_a)
+            self.assertEqual(res1["removed"], [vbs_a.name])
+            self.assertFalse(vbs_a.exists())
+            self.assertTrue(vbs_b.exists())
+            self.assertTrue(legacy_vbs.exists())
+            self.assertTrue(shared_foreign.exists())
+
+            # Idempotent second uninstall
+            res2 = cb.uninstall_startup_launchers(startup, install_a)
+            self.assertEqual(res2["removed"], [])
+            self.assertTrue(vbs_b.exists())
+            self.assertTrue(legacy_vbs.exists())
+
+    def test_firewall_rule_ownership_matching_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install_a = root / "App & (1)" / "clipboard_bridge.py"
+            install_b = root / "App B" / "clipboard_bridge.py"
+            install_a.parent.mkdir()
+            install_b.parent.mkdir()
+            install_a.write_text("# a", encoding="utf-8")
+            install_b.write_text("# b", encoding="utf-8")
+
+            id_a = cb.compute_install_id(install_a)
+            id_b = cb.compute_install_id(install_b)
+            desc_a = cb.format_firewall_description(id_a, install_a)
+            desc_b = cb.format_firewall_description(id_b, install_b)
+
+            self.assertTrue(cb.parse_firewall_ownership(desc_a, id_a, install_a))
+            self.assertFalse(cb.parse_firewall_ownership(desc_b, id_a, install_a))
+            self.assertFalse(cb.parse_firewall_ownership("", id_a, install_a))
+            self.assertFalse(cb.parse_firewall_ownership("Manual rule", id_a, install_a))
+
+            # Inspection unavailable -> fail closed
+            with patch.object(cb, "inspect_firewall_rules_windows", return_value=None):
+                res_abort = cb.uninstall_owned_firewall_rules(5050, id_a, install_a)
+            self.assertEqual(res_abort["status"], "aborted")
+            self.assertEqual(res_abort["removed"], [])
+
+            # Mixed rules: delete ONLY owned rule
+            mock_rules = [
+                {"Name": "{GUID-A}", "DisplayName": f"ClipBridge_5050_{id_a}", "Description": desc_a},
+                {"Name": "{GUID-UNTAGGED}", "DisplayName": "ClipBridge_5050", "Description": ""},
+                {"Name": "{GUID-B}", "DisplayName": f"ClipBridge_5050_{id_b}", "Description": desc_b},
+            ]
+            with (
+                patch.object(cb, "inspect_firewall_rules_windows", return_value=mock_rules),
+                patch.object(cb, "_delete_firewall_rule_instance", return_value=(True, "OK")) as mock_del,
+            ):
+                res_mix = cb.uninstall_owned_firewall_rules(5050, id_a, install_a)
+            self.assertEqual(res_mix["status"], "ok")
+            self.assertEqual(res_mix["removed"], [f"ClipBridge_5050_{id_a}"])
+            self.assertEqual(len(res_mix["skipped"]), 2)
+            mock_del.assert_called_once_with("{GUID-A}")
+
+    def test_cli_cleanup_all_fail_closed_and_ownership_scenarios(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script_a = root / "InstA" / "clipboard_bridge.py"
+            script_a.parent.mkdir()
+            script_a.write_text("# a", encoding="utf-8")
+            id_a = cb.compute_install_id(script_a)
+            id_b = cb.compute_install_id(root / "InstB" / "clipboard_bridge.py")
+
+            temp_dir = root / "temp_a"
+            staged = temp_dir / "staged"
+            hist_dir = temp_dir / "history_files"
+            hist = cb.TransferHistory(
+                maxlen=5,
+                staged_dir=staged,
+                history_files_dir=hist_dir,
+                temp_dir=temp_dir,
+                install_id=id_a,
+                script_path=script_a,
+                get_clipboard_files_fn=lambda: [],
+            )
+            hist.ensure_storage_ownership()
+
+            # Stage an older inactive transfer and an active clipboard transfer in live server
+            with patch.object(cb, "HISTORY", hist), patch.object(cb, "SECRET_KEY", "test-cleanup-secret"):
+                srv = cb.ClipBridgeHTTPServer(("127.0.0.1", 0), cb.ClipboardRequestHandler)
+                live_port = srv.server_address[1]
+                th = threading.Thread(target=srv.serve_forever, daemon=True)
+                th.start()
+                try:
+                    t1, s1 = hist.begin_upload(3)
+                    f1 = s1 / "old.txt"
+                    f1.write_bytes(b"old")
+                    tid1, _, _, _ = hist.commit_upload(t1, s1, [f1], "Phone -> PC", lambda _: True)
+                    hist.release_lease(tid1)
+
+                    t2, s2 = hist.begin_upload(3)
+                    f2 = s2 / "live.txt"
+                    f2.write_bytes(b"new")
+                    tid2, paths2, _, _ = hist.commit_upload(t2, s2, [f2], "Phone -> PC", lambda _: True)
+                    hist.release_lease(tid2)
+
+                    # 1. Running server + wrong key -> HTTP 401 -> ABORT safely
+                    res_401 = cb.run_cli_cleanup(force=False, history_store=hist, port=live_port, secret_key="wrong")
+                    self.assertEqual(res_401["status"], "aborted")
+                    self.assertEqual(res_401["reason"], "unauthorized")
+                    self.assertTrue((staged / tid1).exists())
+                    self.assertTrue(paths2[0].exists())
+
+                    # 2. Running server + valid key -> delegates cleanly, preserves active clipboard
+                    res_ok = cb.run_cli_cleanup(force=False, history_store=hist, port=live_port, secret_key="test-cleanup-secret")
+                    self.assertEqual(res_ok["status"], "ok")
+                    self.assertFalse((staged / tid1).exists())
+                    self.assertTrue(paths2[0].exists())
+
+                    # 3. Timeout -> ABORT safely
+                    with patch.object(cb, "urlopen", side_effect=TimeoutError("timed out")):
+                        res_to = cb.run_cli_cleanup(force=True, history_store=hist, port=live_port, secret_key="test-cleanup-secret")
+                    self.assertEqual(res_to["status"], "aborted")
+                    self.assertEqual(res_to["reason"], "timeout")
+                    self.assertTrue(paths2[0].exists())
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+
+            # 4. Another HTTP service occupies port (returns 404) -> ABORT safely
+            from http.server import BaseHTTPRequestHandler
+
+            class _OtherHandler(BaseHTTPRequestHandler):
+                def log_message(self, *_a):
+                    pass
+
+                def do_POST(self):
+                    self.send_response(404)
+                    self.end_headers()
+
+            other_srv = cb.ClipBridgeHTTPServer(("127.0.0.1", 0), _OtherHandler)
+            other_port = other_srv.server_address[1]
+            other_th = threading.Thread(target=other_srv.serve_forever, daemon=True)
+            other_th.start()
+            try:
+                res_other = cb.run_cli_cleanup(force=True, history_store=hist, port=other_port, secret_key="k")
+                self.assertEqual(res_other["status"], "aborted")
+                self.assertEqual(res_other["reason"], "unexpected_http_service")
+            finally:
+                other_srv.shutdown()
+                other_srv.server_close()
+
+            # Allocate a closed port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                closed_port = probe.getsockname()[1]
+
+            # 5. Port occupied at OS level even when loopback refused -> ABORT safely
+            with patch.object(cb, "_is_port_listening", return_value=True):
+                res_occ = cb.run_cli_cleanup(force=True, history_store=hist, port=closed_port, secret_key="k")
+            self.assertEqual(res_occ["status"], "aborted")
+            self.assertEqual(res_occ["reason"], "port_occupied")
+
+            # 6. Process ownership cannot be verified -> ABORT safely
+            with (
+                patch.object(cb, "_is_port_listening", return_value=False),
+                patch.object(cb, "_verify_no_running_clipbridge_process", return_value=(False, "Opaque Python process")),
+            ):
+                res_proc = cb.run_cli_cleanup(force=True, history_store=hist, port=closed_port, secret_key="k")
+            self.assertEqual(res_proc["status"], "aborted")
+            self.assertEqual(res_proc["reason"], "process_unverifiable")
+
+            # 7. Server lock held -> ABORT safely
+            lock_fh = cb.acquire_server_lock(temp_dir, closed_port, id_a, script_a)
+            try:
+                with (
+                    patch.object(cb, "_is_port_listening", return_value=False),
+                    patch.object(cb, "_verify_no_running_clipbridge_process", return_value=(True, "verified_stopped")),
+                ):
+                    res_lock = cb.run_cli_cleanup(force=True, history_store=hist, port=closed_port, secret_key="k")
+                self.assertEqual(res_lock["status"], "aborted")
+                self.assertEqual(res_lock["reason"], "server_lock_held")
+            finally:
+                cb.release_server_lock(lock_fh)
+
+            # 8. Shared/foreign files inside staged & history_files are preserved even under force=True!
+            foreign_tx = staged / f"tx_{id_b}_foreign_1"
+            foreign_tx.mkdir(parents=True)
+            (foreign_tx / "foreign.txt").write_bytes(b"keep-foreign")
+            legacy_item = hist_dir / "item_legacy"
+            legacy_item.mkdir(parents=True)
+            (legacy_item / "legacy.bin").write_bytes(b"keep-legacy")
+            owned_orphan = staged / ".staging_owned_abandoned"
+            owned_orphan.mkdir(parents=True)
+            (owned_orphan / "part.bin").write_bytes(b"reclaim-me")
+            owned_tx = staged / f"tx_{id_a}_old_session_9"
+            owned_tx.mkdir(parents=True)
+            (owned_tx / "old.txt").write_bytes(b"reclaim-tx")
+
+            with (
+                patch.object(cb, "_is_port_listening", return_value=False),
+                patch.object(cb, "_verify_no_running_clipbridge_process", return_value=(True, "verified_stopped")),
+            ):
+                res_offline = cb.run_cli_cleanup(force=True, history_store=hist, port=closed_port, secret_key="k")
+            self.assertEqual(res_offline["status"], "ok")
+            self.assertFalse(owned_orphan.exists())
+            self.assertFalse(owned_tx.exists())
+            self.assertTrue((foreign_tx / "foreign.txt").exists())
+            self.assertTrue((legacy_item / "legacy.bin").exists())
+
+            # 9. Force cleanup without verified ownership -> REFUSE destructive cleanup
+            hist._owner_file.unlink()
+            with (
+                patch.object(cb, "_is_port_listening", return_value=False),
+                patch.object(cb, "_verify_no_running_clipbridge_process", return_value=(True, "verified_stopped")),
+            ):
+                res_unowned = cb.run_cli_cleanup(force=True, history_store=hist, port=closed_port, secret_key="k")
+            self.assertEqual(res_unowned["status"], "aborted")
+            self.assertEqual(res_unowned["reason"], "ownership_unverified")
+            self.assertTrue((foreign_tx / "foreign.txt").exists())
+            self.assertTrue((legacy_item / "legacy.bin").exists())
 
 
 class TestClipBridgeHTTP(unittest.TestCase):

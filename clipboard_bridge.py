@@ -15,7 +15,10 @@ from collections import deque
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
+import errno
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import http.client
 import io
 import json
 import mimetypes
@@ -23,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -30,11 +34,31 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import Request, urlopen
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 VERSION = "1.0.0"
 APP_DIR = Path(__file__).resolve().parent
+SCRIPT_PATH = Path(__file__).resolve()
 CONFIG_PATH = APP_DIR / "config.json"
+
+
+def canonical_script_path(path: Path | None = None) -> str:
+    target = (path or SCRIPT_PATH).resolve()
+    return os.path.normcase(str(target))
+
+
+def compute_install_id(path: Path | None = None) -> str:
+    return hashlib.sha256(canonical_script_path(path).encode("utf-8")).hexdigest()[:12]
+
+
+INSTALL_ID = compute_install_id(SCRIPT_PATH)
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 WINDOWS_RESERVED_NAMES = {
@@ -60,6 +84,10 @@ class UploadBusyError(RuntimeError):
     """Raised when concurrent inflight uploads exceed capacity or storage budget."""
 
 
+class StorageOwnershipError(PermissionError):
+    """Raised when a temporary storage directory belongs to a different installation."""
+
+
 def _safe_int(value, default: int, min_val: int, max_val: int | None = None) -> int:
     try:
         num = int(value)
@@ -75,7 +103,7 @@ def _safe_int(value, default: int, min_val: int, max_val: int | None = None) -> 
 # ==============================================================================
 # AUTO-CONFIGURATION (config.json)
 # ==============================================================================
-def load_or_create_config() -> dict:
+def load_or_create_config(read_only: bool = False) -> dict:
     default_downloads = str(Path.home() / "Downloads")
     default_cfg = {
         "port": 5050,
@@ -95,20 +123,24 @@ def load_or_create_config() -> dict:
             key_val = str(merged.get("secret_key") or "").strip()
             if not key_val or key_val == "replace-with-your-secret-key":
                 merged["secret_key"] = f"clip-{secrets.token_hex(16)}"
-            if merged != loaded:
+            if not read_only and merged != loaded:
                 CONFIG_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
             return merged
         except Exception:
             pass
 
-    try:
-        CONFIG_PATH.write_text(json.dumps(default_cfg, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    if not read_only:
+        try:
+            CONFIG_PATH.write_text(json.dumps(default_cfg, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     return default_cfg
 
 
-CONFIG = load_or_create_config()
+_CLI_READONLY_MODES = {"--status", "--info", "--install-id", "--unregister", "--uninstall-startup", "--uninstall-firewall", "--check-firewall", "--cleanup", "--cleanup-force"}
+_IS_READONLY_CLI = len(sys.argv) >= 2 and sys.argv[1] in _CLI_READONLY_MODES
+
+CONFIG = load_or_create_config(read_only=_IS_READONLY_CLI)
 PORT = _safe_int(CONFIG.get("port"), 5050, 1, 65535)
 SECRET_KEY = str(CONFIG.get("secret_key") or "").strip() or f"clip-{secrets.token_hex(16)}"
 SAVE_FOLDER = Path(CONFIG.get("save_folder") or str(Path.home() / "Downloads"))
@@ -117,14 +149,14 @@ MAX_UPLOAD_BYTES = _safe_int(CONFIG.get("max_upload_mb"), 512, 1) * 1024 * 1024
 MAX_STORAGE_BYTES = _safe_int(CONFIG.get("max_storage_mb"), 1024, 1) * 1024 * 1024
 RETENTION_SECONDS = _safe_int(CONFIG.get("retention_minutes"), 60, 1) * 60
 
-TEMP_DIR = Path(tempfile.gettempdir()) / "ClipBridge"
+SHARED_TEMP_ROOT = Path(tempfile.gettempdir()) / "ClipBridge"
+TEMP_DIR = SHARED_TEMP_ROOT / "installs" / INSTALL_ID
 STAGED_DIR = TEMP_DIR / "staged"
 HISTORY_FILES_DIR = TEMP_DIR / "history_files"
 PC_CLIPBOARD_IMAGE_PATH = TEMP_DIR / "pc_clipboard.png"
 LATEST_TRANSFER_FILE = TEMP_DIR / "latest_transfer.json"
-
-for _d in (TEMP_DIR, STAGED_DIR, HISTORY_FILES_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
+STORAGE_OWNER_FILE = TEMP_DIR / ".owner.json"
+SERVER_LOCK_FILE = TEMP_DIR / ".server.lock"
 
 
 def _is_strict_subpath(path: Path, root: Path) -> bool:
@@ -198,10 +230,14 @@ class TransferHistory:
         retention_seconds: float | None = None,
         get_clipboard_seq_fn=None,
         get_clipboard_files_fn=None,
+        install_id: str | None = None,
+        script_path: Path | None = None,
     ):
         self.lock = threading.RLock()
         self.commit_lock = threading.Lock()
         self.maxlen = max(1, int(maxlen))
+        self.script_path = (script_path or SCRIPT_PATH).resolve()
+        self.install_id = install_id or compute_install_id(self.script_path)
         self.staged_dir = staged_dir or STAGED_DIR
         self.history_files_dir = history_files_dir or HISTORY_FILES_DIR
         self.temp_dir = temp_dir or TEMP_DIR
@@ -210,17 +246,70 @@ class TransferHistory:
         self._get_clipboard_seq_fn = get_clipboard_seq_fn
         self._get_clipboard_files_fn = get_clipboard_files_fn
         self._latest_transfer_file = self.temp_dir / "latest_transfer.json"
+        self._owner_file = self.temp_dir / ".owner.json"
+        self._server_lock_file = self.temp_dir / ".server.lock"
 
-        self.staged_dir.mkdir(parents=True, exist_ok=True)
-        self.history_files_dir.mkdir(parents=True, exist_ok=True)
-
-        self.session_id = f"{int(time.time())}_{secrets.token_hex(4)}"
+        self.session_id = f"{self.install_id}_{int(time.time())}_{secrets.token_hex(4)}"
         self.items: deque[dict] = deque()
         self._counter = 0
         self._seq = 0
         self._transfers: dict[str, dict] = {}
         self._active_clipboard_tid: str | None = None
         self._inflight_uploads: dict[str, int] = {}
+
+    def verify_storage_ownership(self) -> tuple[bool, str]:
+        if not self.temp_dir.is_dir():
+            return False, "temporary storage directory does not exist"
+        if not self._owner_file.is_file():
+            return False, "missing .owner.json manifest"
+        try:
+            data = json.loads(self._owner_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False, "invalid .owner.json manifest"
+            owner_id = str(data.get("install_id", "")).strip()
+            owner_path = os.path.normcase(str(data.get("script_path", "")).strip())
+            expected_path = canonical_script_path(self.script_path)
+            if owner_id != self.install_id or owner_path != expected_path:
+                return False, f"storage belongs to another installation ({data.get('script_path', 'unknown')})"
+            return True, "verified"
+        except Exception as exc:
+            return False, f"unable to read .owner.json ({exc})"
+
+    def ensure_storage_ownership(self):
+        if self._owner_file.exists():
+            ok, reason = self.verify_storage_ownership()
+            if not ok:
+                raise StorageOwnershipError(f"Refusing to claim storage: {reason}")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.staged_dir.mkdir(parents=True, exist_ok=True)
+        self.history_files_dir.mkdir(parents=True, exist_ok=True)
+        if not self._owner_file.exists():
+            _atomic_write_json(
+                self._owner_file,
+                {
+                    "install_id": self.install_id,
+                    "script_path": canonical_script_path(self.script_path),
+                    "version": VERSION,
+                },
+            )
+
+    @staticmethod
+    def _is_foreign_entry(child: Path, own_install_id: str, own_script_path: Path) -> bool:
+        if child.is_dir() and (child / ".owner.json").is_file():
+            try:
+                data = json.loads((child / ".owner.json").read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    return True
+                cid = str(data.get("install_id", "")).strip()
+                cpath = os.path.normcase(str(data.get("script_path", "")).strip())
+                if cid != own_install_id or cpath != canonical_script_path(own_script_path):
+                    return True
+            except Exception:
+                return True
+        m = re.match(r"^(?:tx|s)_([0-9a-f]{12})_", child.name)
+        if m and m.group(1) != own_install_id:
+            return True
+        return False
 
     def _current_clipboard_seq(self) -> int | None:
         if self._get_clipboard_seq_fn is not None:
@@ -387,6 +476,7 @@ class TransferHistory:
 
     def begin_upload(self, content_length: int) -> tuple[str, Path]:
         with self.lock:
+            self.ensure_storage_ownership()
             if len(self._inflight_uploads) >= MAX_CONCURRENT_UPLOADS:
                 raise UploadBusyError("Too many concurrent uploads in progress")
             inflight_total = sum(self._inflight_uploads.values())
@@ -553,6 +643,7 @@ class TransferHistory:
                 pass
 
         with self.lock:
+            self.ensure_storage_ownership()
             self._counter += 1
             self._seq += 1
             entry_id = self._counter
@@ -625,6 +716,7 @@ class TransferHistory:
 
     def add_image_bytes(self, filename: str, data: bytes, direction: str) -> dict:
         with self.lock:
+            self.ensure_storage_ownership()
             self._counter += 1
             self._seq += 1
             entry_id = self._counter
@@ -869,11 +961,41 @@ class TransferHistory:
                 "warning": warning,
             }
 
-    def cleanup_orphans_on_startup(self, force: bool = False) -> dict:
+    def cleanup_orphans_on_startup(self, force: bool = False, require_verified_owner: bool = False) -> dict:
         """
         Reclaim orphaned staged/history files left on disk by earlier runs without
-        touching anything outside TEMP_DIR or files currently referenced by Windows CF_HDROP.
+        touching foreign installations, anything outside TEMP_DIR, or live Windows CF_HDROP files.
         """
+        with self.lock:
+            if self._owner_file.exists():
+                ok_owner, owner_reason = self.verify_storage_ownership()
+                if not ok_owner:
+                    return {
+                        "status": "aborted",
+                        "ok": False,
+                        "reason": "ownership_mismatch",
+                        "reclaimed_bytes": 0,
+                        "reclaimed_human": "0 B",
+                        "reclaimed_count": 0,
+                        "preserved_active_count": 0,
+                        "preserved_foreign_count": 0,
+                        "preserved_files": [],
+                        "warning": f"Refused cleanup: {owner_reason}.",
+                    }
+            elif require_verified_owner:
+                return {
+                    "status": "aborted",
+                    "ok": False,
+                    "reason": "ownership_unverified",
+                    "reclaimed_bytes": 0,
+                    "reclaimed_human": "0 B",
+                    "reclaimed_count": 0,
+                    "preserved_active_count": 0,
+                    "preserved_foreign_count": 0,
+                    "preserved_files": [],
+                    "warning": "Refused cleanup: storage ownership cannot be verified (missing .owner.json).",
+                }
+
         clipboard_files = set()
         if not force:
             for p in self._current_clipboard_files():
@@ -884,14 +1006,23 @@ class TransferHistory:
 
         reclaimed_bytes = 0
         reclaimed_count = 0
+        preserved_foreign_count = 0
         adopted_files: list[str] = []
+        owned_hist_prefix = f"s_{self.install_id}_"
+        owned_tx_prefix = f"tx_{self.install_id}_"
 
         with self.lock:
-            # Clean previous-session history_files directories.
+            # Clean previous-session history_files directories owned by this installation.
             if self.history_files_dir.exists():
                 session_prefix = f"s_{self.session_id}_"
                 for child in list(self.history_files_dir.iterdir()):
                     if child.name.startswith(session_prefix):
+                        continue
+                    if self._is_foreign_entry(child, self.install_id, self.script_path):
+                        preserved_foreign_count += 1
+                        continue
+                    if require_verified_owner and not child.name.startswith(owned_hist_prefix):
+                        preserved_foreign_count += 1
                         continue
                     reclaimed_bytes += _dir_size_bytes(child)
                     if _safe_rmtree(child, (self.history_files_dir,)):
@@ -903,10 +1034,16 @@ class TransferHistory:
                 for child in list(self.staged_dir.iterdir()):
                     if child.name.startswith(f"tx_{self.session_id}_"):
                         continue
+                    if self._is_foreign_entry(child, self.install_id, self.script_path):
+                        preserved_foreign_count += 1
+                        continue
                     if child.name.startswith(".staging_"):
                         reclaimed_bytes += _dir_size_bytes(child)
                         if _safe_rmtree(child, (self.staged_dir,)):
                             reclaimed_count += 1
+                        continue
+                    if require_verified_owner and not child.name.startswith(owned_tx_prefix):
+                        preserved_foreign_count += 1
                         continue
 
                     child_files: list[Path] = []
@@ -984,20 +1121,26 @@ class TransferHistory:
                     except OSError:
                         pass
 
-        warning = ""
+        warnings = []
         if adopted_files:
-            warning = (
+            warnings.append(
                 f"Preserved {len(adopted_files)} staged file(s) ({', '.join(adopted_files[:3])}) "
                 "currently referenced by the Windows clipboard."
             )
+        if preserved_foreign_count:
+            warnings.append(
+                f"Preserved {preserved_foreign_count} unrecognized or foreign storage item(s)."
+            )
         return {
             "status": "ok",
+            "ok": True,
             "reclaimed_bytes": reclaimed_bytes,
             "reclaimed_human": format_size(reclaimed_bytes),
             "reclaimed_count": reclaimed_count,
             "preserved_active_count": 1 if adopted_tid else 0,
+            "preserved_foreign_count": preserved_foreign_count,
             "preserved_files": adopted_files,
-            "warning": warning,
+            "warning": " ".join(warnings),
         }
 
 
@@ -1286,6 +1429,7 @@ class WindowsBridge:
                     return {"type": "text", "data": txt} if txt else {"type": "empty"}
                 return {"type": "empty"}
 
+            TEMP_DIR.mkdir(parents=True, exist_ok=True)
             tmp_img_path = TEMP_DIR / f"pc_clipboard_{threading.get_ident()}_{secrets.token_hex(4)}.tmp.png"
             b64_img_path = base64.b64encode(str(tmp_img_path.resolve()).encode("utf-8")).decode("ascii")
             ps = f"""
@@ -2610,38 +2754,645 @@ class ClipboardRequestHandler(BaseHTTPRequestHandler):
 
 
 # ==============================================================================
-# PROTOCOL HANDLER & CLI ENTRYPOINT
+# INSTALLATION OWNERSHIP, PROTOCOL HANDLER & CLI ENTRYPOINT
 # ==============================================================================
-def register_protocol_handler():
+_HELPER_CLI_FLAGS = (
+    "--status",
+    "--info",
+    "--install-id",
+    "--register-only",
+    "--unregister",
+    "--install-startup",
+    "--uninstall-startup",
+    "--uninstall-firewall",
+    "--check-firewall",
+    "--cleanup",
+    "--cleanup-force",
+    "--protocol",
+)
+
+
+def parse_protocol_command_script(command_value: str) -> Path | None:
+    if not command_value or not isinstance(command_value, str):
+        return None
+    try:
+        tokens = shlex.split(command_value.strip(), posix=False)
+    except ValueError:
+        return None
+    cleaned = [t.strip().strip('"').strip("'") for t in tokens if t.strip()]
+    for tok in cleaned:
+        if tok.lower().endswith(".py"):
+            try:
+                return Path(tok).resolve()
+            except Exception:
+                return None
+    return None
+
+
+def is_protocol_command_owned(command_value: str, script_path: Path | None = None) -> bool:
+    parsed = parse_protocol_command_script(command_value)
+    if parsed is None:
+        return False
+    return os.path.normcase(str(parsed)) == canonical_script_path(script_path)
+
+
+def _read_protocol_registry_command() -> str | None:
     if sys.platform != "win32":
-        return
+        return None
+    import winreg
+
+    key_path = r"Software\Classes\clipbridge\shell\open\command"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, "")
+            return str(val) if val is not None else None
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+def _protocol_key_exists() -> bool:
+    if sys.platform != "win32":
+        return False
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\clipbridge", 0, winreg.KEY_READ):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def get_protocol_status(script_path: Path | None = None) -> dict:
+    registered = _protocol_key_exists()
+    cmd = _read_protocol_registry_command() if registered else None
+    parsed = parse_protocol_command_script(cmd) if cmd else None
+    owned = bool(registered and cmd and is_protocol_command_owned(cmd, script_path))
+    return {
+        "registered": registered,
+        "command": cmd,
+        "target_script": str(parsed) if parsed else None,
+        "owned_by_current": owned,
+    }
+
+
+def register_protocol_handler(script_path: Path | None = None) -> dict:
+    if sys.platform != "win32":
+        return {"status": "unsupported", "registered": False}
+    import winreg
+
+    target_script = (script_path or SCRIPT_PATH).resolve()
     python_exe = Path(sys.executable)
     pythonw_exe = python_exe.with_name("pythonw.exe")
-    runner = str(pythonw_exe if pythonw_exe.exists() else python_exe).replace("'", "''")
-    script_path = str(Path(__file__).resolve()).replace("'", "''")
+    runner = str(pythonw_exe if pythonw_exe.exists() else python_exe)
+    cmd_val = f'"{runner}" "{target_script}" --protocol "%1"'
 
-    ps_reg = f"""
-$baseKey = 'HKCU:\\Software\\Classes\\clipbridge'
-New-Item -Path $baseKey -Force | Out-Null
-Set-ItemProperty -Path $baseKey -Name '(Default)' -Value 'URL:ClipBridge Protocol'
-Set-ItemProperty -Path $baseKey -Name 'URL Protocol' -Value ''
-$cmdKey = "$baseKey\\shell\\open\\command"
-New-Item -Path $cmdKey -Force | Out-Null
-$cmdVal = '"{runner}" "{script_path}" --protocol "%1"'
-Set-ItemProperty -Path $cmdKey -Name '(Default)' -Value $cmdVal
-"""
-    run_ps_oneshot(ps_reg, timeout_sec=10)
+    prev = get_protocol_status(target_script)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\clipbridge") as base_key:
+        winreg.SetValueEx(base_key, "", 0, winreg.REG_SZ, "URL:ClipBridge Protocol")
+        winreg.SetValueEx(base_key, "URL Protocol", 0, winreg.REG_SZ, "")
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\clipbridge\shell\open\command") as cmd_key:
+        winreg.SetValueEx(cmd_key, "", 0, winreg.REG_SZ, cmd_val)
+
+    return {
+        "status": "ok",
+        "registered": True,
+        "replaced_foreign": bool(prev["registered"] and not prev["owned_by_current"]),
+        "previous_target": prev["target_script"],
+        "command": cmd_val,
+    }
 
 
-def unregister_protocol_handler():
+def unregister_protocol_handler(script_path: Path | None = None) -> dict:
     if sys.platform != "win32":
-        return
-    ps_unreg = """
-if (Test-Path 'HKCU:\\Software\\Classes\\clipbridge') {
-    Remove-Item -Path 'HKCU:\\Software\\Classes\\clipbridge' -Recurse -Force
-}
+        return {"status": "unsupported", "removed": False, "message": "Windows registry not applicable."}
+    import winreg
+
+    target_script = (script_path or SCRIPT_PATH).resolve()
+    status = get_protocol_status(target_script)
+    if not status["registered"]:
+        return {"status": "absent", "removed": False, "message": "clipbridge:// protocol is not registered."}
+    if not status["owned_by_current"]:
+        owner = status["target_script"] or "unknown/unparseable command"
+        return {
+            "status": "skipped",
+            "removed": False,
+            "owner": owner,
+            "message": f"Skipped clipbridge:// protocol: registered to another installation ({owner}).",
+        }
+
+    for subkey in (
+        r"Software\Classes\clipbridge\shell\open\command",
+        r"Software\Classes\clipbridge\shell\open",
+        r"Software\Classes\clipbridge\shell",
+        r"Software\Classes\clipbridge",
+    ):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
+        except FileNotFoundError:
+            pass
+    return {
+        "status": "removed",
+        "removed": True,
+        "message": "Unregistered clipbridge:// protocol owned by this installation.",
+    }
+
+
+def get_startup_dir() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def build_startup_vbs_content(runner: Path | str, script_path: Path | None = None) -> str:
+    target = (script_path or SCRIPT_PATH).resolve()
+    iid = compute_install_id(target)
+    canon = canonical_script_path(target)
+    runner_esc = str(runner).replace('"', '""')
+    script_esc = str(target).replace('"', '""')
+    return (
+        f"' ClipBridge-Install-Id: {iid}\n"
+        f"' ClipBridge-Script: {canon}\n"
+        'Set WshShell = CreateObject("WScript.Shell")\n'
+        f'WshShell.Run """{runner_esc}"" ""{script_esc}""", 0, False\n'
+    )
+
+
+def _extract_vbs_script_path(vbs_text: str) -> Path | None:
+    if not vbs_text:
+        return None
+    for line in vbs_text.splitlines():
+        m_hdr = re.match(r"^\s*'\s*ClipBridge-Script:\s*(.+?)\s*$", line, re.IGNORECASE)
+        if m_hdr:
+            try:
+                return Path(m_hdr.group(1).strip()).resolve()
+            except Exception:
+                return None
+    m_run = re.search(r'WshShell\.Run\s+.*?"([^"\r\n]+\.py)"', vbs_text, re.IGNORECASE)
+    if m_run:
+        raw_p = m_run.group(1).replace('""', '"').strip('"')
+        try:
+            return Path(raw_p).resolve()
+        except Exception:
+            return None
+    return None
+
+
+def is_startup_launcher_owned(vbs_path: Path, script_path: Path | None = None) -> bool:
+    if not vbs_path.is_file():
+        return False
+    if vbs_path.name.lower() == "clipboardbridge_silentstartup.vbs":
+        return False
+    target = (script_path or SCRIPT_PATH).resolve()
+    expected_canon = canonical_script_path(target)
+    expected_id = compute_install_id(target)
+    try:
+        text = vbs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    m_id = re.search(r"^\s*'\s*ClipBridge-Install-Id:\s*([0-9a-f]{12})\s*$", text, re.IGNORECASE | re.MULTILINE)
+    if m_id and m_id.group(1).lower() != expected_id:
+        return False
+
+    extracted = _extract_vbs_script_path(text)
+    if extracted is None:
+        return False
+    return os.path.normcase(str(extracted)) == expected_canon
+
+
+def install_startup_launcher(
+    startup_dir: Path | None = None,
+    script_path: Path | None = None,
+    runner: Path | str | None = None,
+) -> Path:
+    target = (script_path or SCRIPT_PATH).resolve()
+    iid = compute_install_id(target)
+    sdir = startup_dir or get_startup_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    if runner is None:
+        python_exe = Path(sys.executable)
+        pythonw_exe = python_exe.with_name("pythonw.exe")
+        runner = pythonw_exe if pythonw_exe.exists() else python_exe
+    vbs_path = sdir / f"ClipBridge_{iid}.vbs"
+    vbs_path.write_text(build_startup_vbs_content(runner, target), encoding="utf-8")
+    return vbs_path
+
+
+def uninstall_startup_launchers(
+    startup_dir: Path | None = None,
+    script_path: Path | None = None,
+) -> dict:
+    target = (script_path or SCRIPT_PATH).resolve()
+    iid = compute_install_id(target)
+    sdir = startup_dir or get_startup_dir()
+    removed: list[str] = []
+    skipped: list[str] = []
+
+    if not sdir.exists():
+        return {"status": "ok", "removed": removed, "skipped": skipped}
+
+    candidates = [
+        sdir / f"ClipBridge_{iid}.vbs",
+        sdir / "ClipBridge_SilentStartup.vbs",
+    ]
+    for cand in candidates:
+        if not cand.exists():
+            continue
+        if is_startup_launcher_owned(cand, target):
+            try:
+                cand.unlink()
+                removed.append(cand.name)
+            except OSError as exc:
+                skipped.append(f"{cand.name} (delete failed: {exc})")
+        else:
+            skipped.append(f"{cand.name} (owned by another installation or ambiguous)")
+
+    # Report any foreign ClipBridge_*.vbs launchers transparently without deleting them.
+    for other in sorted(sdir.glob("ClipBridge*.vbs")):
+        if other.name in removed or other in candidates:
+            continue
+        skipped.append(f"{other.name} (foreign installation)")
+
+    return {"status": "ok", "removed": removed, "skipped": skipped}
+
+
+def get_firewall_rule_name(port: int, install_id: str | None = None) -> str:
+    iid = install_id or INSTALL_ID
+    return f"ClipBridge_{port}_{iid}"
+
+
+def format_firewall_description(install_id: str | None = None, script_path: Path | None = None) -> str:
+    target = (script_path or SCRIPT_PATH).resolve()
+    iid = install_id or compute_install_id(target)
+    return f"ClipBridge [id={iid}] path={canonical_script_path(target)}"
+
+
+def parse_firewall_ownership(
+    description: str,
+    install_id: str | None = None,
+    script_path: Path | None = None,
+) -> bool:
+    if not description or not isinstance(description, str):
+        return False
+    target = (script_path or SCRIPT_PATH).resolve()
+    expected_id = (install_id or compute_install_id(target)).lower()
+    expected_path = canonical_script_path(target)
+    m = re.match(r"^\s*ClipBridge\s+\[id=([0-9a-f]{12})\]\s+path=(.+?)\s*$", description, re.IGNORECASE)
+    if not m:
+        return False
+    rule_id = m.group(1).lower()
+    try:
+        rule_path = os.path.normcase(str(Path(m.group(2).strip()).resolve()))
+    except Exception:
+        return False
+    return rule_id == expected_id and rule_path == expected_path
+
+
+def inspect_firewall_rules_windows(rule_names: list[str]) -> list[dict] | None:
+    if sys.platform != "win32":
+        return []
+    payload = json.dumps({"names": rule_names})
+    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+    ps = f"""
+$cfg = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64}')) | ConvertFrom-Json
+$out = @()
+foreach ($n in $cfg.names) {{
+    $rules = @(Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue)
+    foreach ($r in $rules) {{
+        $out += [PSCustomObject]@{{
+            Name = [string]$r.Name
+            DisplayName = [string]$r.DisplayName
+            Description = [string]$r.Description
+        }}
+    }}
+}}
+if ($out.Count -eq 0) {{
+    Write-Output "[]"
+}} else {{
+    $json = ConvertTo-Json -InputObject @($out) -Compress
+    Write-Output $json
+}}
 """
-    run_ps_oneshot(ps_unreg, timeout_sec=10)
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            startupinfo=startupinfo,
+            creationflags=0x08000000,
+        )
+        if proc.returncode != 0:
+            return None
+        parsed = json.loads((proc.stdout or "").strip() or "[]")
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return parsed
+        return None
+    except Exception:
+        return None
+
+
+def _delete_firewall_rule_instance(instance_name: str) -> tuple[bool, str]:
+    if sys.platform != "win32":
+        return False, "NotWindows"
+    b64 = base64.b64encode(instance_name.encode("utf-8")).decode("ascii")
+    ps = f"""
+$id = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{b64}'))
+try {{
+    Remove-NetFirewallRule -Name $id -ErrorAction Stop
+    Write-Output "OK"
+}} catch {{
+    Write-Output ("ERR:" + $_.Exception.Message)
+    exit 1
+}}
+"""
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=10,
+            startupinfo=startupinfo,
+            creationflags=0x08000000,
+        )
+        out = (proc.stdout or "").strip()
+        return (proc.returncode == 0 and "OK" in out), out
+    except Exception as exc:
+        return False, str(exc)
+
+
+def uninstall_owned_firewall_rules(
+    port: int,
+    install_id: str | None = None,
+    script_path: Path | None = None,
+) -> dict:
+    target = (script_path or SCRIPT_PATH).resolve()
+    iid = install_id or compute_install_id(target)
+    candidates = [get_firewall_rule_name(port, iid), f"ClipBridge_{port}"]
+    rules = inspect_firewall_rules_windows(candidates)
+    if rules is None:
+        return {
+            "status": "aborted",
+            "removed": [],
+            "skipped": ["Could not verify Windows Firewall rule ownership; failing closed."],
+            "needs_elevation": False,
+        }
+
+    removed: list[str] = []
+    skipped: list[str] = []
+    needs_elevation = False
+    for rule in rules:
+        display_name = str(rule.get("DisplayName", ""))
+        instance_name = str(rule.get("Name", ""))
+        desc = str(rule.get("Description", ""))
+        if not parse_firewall_ownership(desc, iid, target):
+            skipped.append(f"{display_name} (untagged or owned by another installation)")
+            continue
+        ok, err = _delete_firewall_rule_instance(instance_name)
+        if ok:
+            removed.append(display_name)
+        else:
+            needs_elevation = True
+            skipped.append(f"{display_name} (removal requires Administrator privileges: {err})")
+
+    return {
+        "status": "ok",
+        "removed": removed,
+        "skipped": skipped,
+        "needs_elevation": needs_elevation,
+    }
+
+
+def _lock_file_nonblocking(fh) -> bool:
+    try:
+        if sys.platform == "win32":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock_file(fh):
+    try:
+        if sys.platform == "win32":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def acquire_server_lock(temp_dir: Path, port: int, install_id: str, script_path: Path):
+    lock_path = temp_dir / ".server.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+", encoding="utf-8")
+    if not _lock_file_nonblocking(fh):
+        fh.close()
+        raise RuntimeError(f"Another ClipBridge instance for this installation already holds {lock_path}")
+    fh.seek(0)
+    fh.truncate(0)
+    fh.write(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "port": port,
+                "install_id": install_id,
+                "script_path": canonical_script_path(script_path),
+            }
+        )
+    )
+    fh.flush()
+    return fh
+
+
+def release_server_lock(fh):
+    if fh is None:
+        return
+    try:
+        _unlock_file(fh)
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def is_server_lock_held(temp_dir: Path) -> bool:
+    lock_path = temp_dir / ".server.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with lock_path.open("r+", encoding="utf-8") as fh:
+            if _lock_file_nonblocking(fh):
+                _unlock_file(fh)
+                return False
+            return True
+    except OSError:
+        return True
+
+
+def _is_command_line_for_script(cmd_line: str, script_path: Path) -> bool:
+    if not cmd_line or not isinstance(cmd_line, str):
+        return False
+    expected = canonical_script_path(script_path)
+    try:
+        tokens = shlex.split(cmd_line, posix=False)
+    except ValueError:
+        tokens = cmd_line.split()
+    cleaned = [t.strip().strip('"').strip("'") for t in tokens if t.strip()]
+    if any(tok in _HELPER_CLI_FLAGS for tok in cleaned):
+        return False
+    for tok in cleaned:
+        if tok.lower().endswith(".py"):
+            try:
+                if os.path.normcase(str(Path(tok).resolve())) == expected:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _is_port_listening(port: int) -> bool | None:
+    # 1. OS listener check first on Windows (avoids waiting 2s on closed loopback ports if occupied)
+    if sys.platform == "win32":
+        ps = (
+            f"$c = @(Get-NetTCPConnection -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue); "
+            "Write-Output $c.Count"
+        )
+        encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=8,
+                startupinfo=startupinfo,
+                creationflags=0x08000000,
+            )
+            if proc.returncode != 0:
+                return None
+            count_val = int((proc.stdout or "").strip())
+            if count_val > 0:
+                return True
+        except Exception:
+            return None
+
+    # 2. Direct loopback connect probe (Windows SYN retry takes ~2.05s before WSAECONNREFUSED)
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3.5):
+            return True
+    except ConnectionRefusedError:
+        if sys.platform == "win32":
+            return False
+    except OSError as exc:
+        if exc.errno in {errno.ECONNREFUSED, 10061}:
+            if sys.platform == "win32":
+                return False
+        return None
+
+    # POSIX bind probe
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", port))
+            return False
+    except OSError as exc:
+        if exc.errno in {errno.EADDRINUSE, 98, 48}:
+            return True
+        return None
+
+
+def _verify_no_running_clipbridge_process(script_path: Path) -> tuple[bool, str]:
+    target = script_path.resolve()
+    if sys.platform == "win32":
+        ps = (
+            "$procs = @(Get-CimInstance Win32_Process | Where-Object { "
+            "$_.Name -match '^(?:python(?:w|3(?:\\.\\d+)?)?|pyw?)\\.exe$' "
+            "} | Select-Object ProcessId, CommandLine); "
+            "if ($procs.Count -eq 0) { Write-Output '[]' } "
+            "else { ConvertTo-Json -InputObject @($procs) -Compress }"
+        )
+        encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        try:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=10,
+                startupinfo=startupinfo,
+                creationflags=0x08000000,
+            )
+            if proc.returncode != 0:
+                return False, "Process inspection failed; refusing offline cleanup."
+            raw = (proc.stdout or "").strip() or "[]"
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if not isinstance(parsed, list):
+                return False, "Unexpected process inspection output; refusing offline cleanup."
+        except Exception as exc:
+            return False, f"Process inspection unavailable ({exc}); refusing offline cleanup."
+
+        my_pid = os.getpid()
+        for entry in parsed:
+            pid = entry.get("ProcessId")
+            if pid == my_pid:
+                continue
+            cmd = entry.get("CommandLine")
+            if cmd is None or not str(cmd).strip():
+                return (
+                    False,
+                    f"Opaque Python process (PID {pid}) prevents verifying server state; refusing offline cleanup.",
+                )
+            if _is_command_line_for_script(str(cmd), target):
+                return False, f"ClipBridge server for this installation is running (PID {pid})."
+        return True, "verified_stopped"
+
+    # POSIX / Linux inspection via /proc when available
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        my_pid = str(os.getpid())
+        for pid_dir in proc_root.iterdir():
+            if not pid_dir.name.isdigit() or pid_dir.name == my_pid:
+                continue
+            try:
+                raw_cmd = (pid_dir / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if not raw_cmd:
+                continue
+            parts = [p.decode("utf-8", errors="replace") for p in raw_cmd.split(b"\x00") if p]
+            if parts and "python" in Path(parts[0]).name.lower():
+                joined = " ".join(f'"{p}"' if " " in p else p for p in parts)
+                if _is_command_line_for_script(joined, target):
+                    return False, f"ClipBridge server for this installation is running (PID {pid_dir.name})."
+    return True, "verified_stopped"
 
 
 def handle_protocol_invocation(uri: str):
@@ -2662,41 +3413,132 @@ def handle_protocol_invocation(uri: str):
             os.startfile(str(SAVE_FOLDER))
 
 
-def run_cli_cleanup(force: bool = False) -> dict:
-    """
-    Delegates non-destructive (or forced) cleanup to the live server if running,
-    or performs safe offline orphan cleanup while preserving active Windows clipboard files.
-    """
-    from urllib.request import Request, urlopen
+def _is_connection_refused(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, URLError):
+        return _is_connection_refused(exc.reason)
+    if isinstance(exc, OSError) and exc.errno in {errno.ECONNREFUSED, 10061}:
+        return True
+    return False
 
-    url = f"http://127.0.0.1:{PORT}/api/cleanup"
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, URLError):
+        return _is_timeout_error(exc.reason)
+    return False
+
+
+def _aborted_cleanup(reason: str, warning: str) -> dict:
+    return {
+        "status": "aborted",
+        "ok": False,
+        "reason": reason,
+        "reclaimed_bytes": 0,
+        "reclaimed_human": "0 B",
+        "reclaimed_count": 0,
+        "preserved_active_count": 0,
+        "preserved_foreign_count": 0,
+        "warning": warning,
+    }
+
+
+def run_cli_cleanup(
+    force: bool = False,
+    history_store: TransferHistory | None = None,
+    port: int | None = None,
+    secret_key: str | None = None,
+) -> dict:
+    """
+    Fail-closed cleanup:
+    1. Delegates to a running authenticated ClipBridge server on PORT.
+    2. Aborts immediately on HTTP 401/403, unexpected HTTP responses, timeouts,
+       occupied ports, running/opaque processes, active server locks, or unverified storage ownership.
+    3. Executes offline cleanup ONLY after proving the server is stopped and storage belongs to this installation.
+    """
+    store = history_store or HISTORY
+    target_port = PORT if port is None else int(port)
+    key = SECRET_KEY if secret_key is None else str(secret_key)
+
+    url = f"http://127.0.0.1:{target_port}/api/cleanup"
     body = json.dumps({"force": bool(force)}).encode("utf-8")
     req = Request(
         url,
         data=body,
         headers={
-            "X-Secret-Key": SECRET_KEY,
+            "X-Secret-Key": key,
             "Content-Type": "application/json",
         },
         method="POST",
     )
     try:
-        with urlopen(req, timeout=3) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return HISTORY.cleanup_orphans_on_startup(force=force)
+        with urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                return _aborted_cleanup("unexpected_response", "Unexpected response from server; cleanup aborted.")
+            data.setdefault("ok", True)
+            return data
+    except HTTPError as err:
+        code = err.code
+        err.close()
+        if code in {401, 403}:
+            return _aborted_cleanup("unauthorized", f"Server rejected authentication (HTTP {code}); offline cleanup aborted.")
+        return _aborted_cleanup("unexpected_http_service", f"Port {target_port} responded with HTTP {code}; offline cleanup aborted.")
+    except (http.client.HTTPException, json.JSONDecodeError) as exc:
+        return _aborted_cleanup("unexpected_service", f"Non-ClipBridge or invalid service on port {target_port} ({exc}); cleanup aborted.")
+    except Exception as exc:
+        if _is_timeout_error(exc):
+            return _aborted_cleanup("timeout", f"Cleanup request timed out on port {target_port}; offline cleanup aborted.")
+        if not _is_connection_refused(exc):
+            return _aborted_cleanup("network_error", f"Could not verify port {target_port} ({exc}); offline cleanup aborted.")
+
+    # Only reached on confirmed ConnectionRefusedError: fail closed unless all safety checks pass.
+    port_listening = _is_port_listening(target_port)
+    if port_listening is True:
+        return _aborted_cleanup("port_occupied", f"Port {target_port} is occupied by another listener; offline cleanup aborted.")
+    if port_listening is None:
+        return _aborted_cleanup("port_unverifiable", f"Could not verify whether port {target_port} is free; offline cleanup aborted.")
+
+    if is_server_lock_held(store.temp_dir):
+        return _aborted_cleanup("server_lock_held", "Active ClipBridge server lock detected; offline cleanup aborted.")
+
+    proc_ok, proc_msg = _verify_no_running_clipbridge_process(store.script_path)
+    if not proc_ok:
+        return _aborted_cleanup("process_unverifiable", proc_msg)
+
+    owner_ok, owner_msg = store.verify_storage_ownership()
+    if not owner_ok:
+        return _aborted_cleanup(
+            "ownership_unverified",
+            f"Storage ownership could not be verified ({owner_msg}); offline cleanup refused.",
+        )
+
+    return store.cleanup_orphans_on_startup(force=force, require_verified_owner=True)
 
 
-def print_status_banner():
+def print_status_banner(include_protocol: bool = False):
     local_ip = get_local_ip()
     web_url = f"http://{local_ip}:{PORT}/?key={SECRET_KEY}"
     import_url = f"http://{local_ip}:{PORT}/setup/shortcuts.json?key={SECRET_KEY}"
     print("======================================================================")
     print(f"  ClipBridge v{VERSION} — By Zeyad Ahmed")
     print("======================================================================")
+    print(f"  Install ID         : {INSTALL_ID}")
     print(f"  Config File        : {CONFIG_PATH}")
     print(f"  Save Folder        : {SAVE_FOLDER}")
+    print(f"  Temp Storage Dir   : {TEMP_DIR}")
     print(f"  Temp Storage Cap   : {format_size(MAX_STORAGE_BYTES)} (TTL {max(1, int(RETENTION_SECONDS // 60))} min)")
+    if include_protocol:
+        proto = get_protocol_status(SCRIPT_PATH)
+        if not proto["registered"]:
+            proto_desc = "Not registered"
+        elif proto["owned_by_current"]:
+            proto_desc = "Registered (this installation)"
+        else:
+            proto_desc = f"Registered to another installation ({proto['target_script'] or 'unknown'})"
+        print(f"  Protocol Handler   : {proto_desc}")
     print(f"  Local Server URL   : http://{local_ip}:{PORT}")
     print(f"  Secret Key         : {SECRET_KEY}")
     print("----------------------------------------------------------------------")
@@ -2708,59 +3550,119 @@ def print_status_banner():
     print("======================================================================")
 
 
-def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--protocol":
-        handle_protocol_invocation(sys.argv[2])
-        return
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--unregister":
-        unregister_protocol_handler()
-        print("Unregistered clipbridge:// protocol.")
-        return
+    if len(args) == 2 and args[0] == "--protocol":
+        handle_protocol_invocation(args[1])
+        return 0
 
-    if len(sys.argv) >= 2 and sys.argv[1] in {"--cleanup", "--cleanup-force"}:
-        force = sys.argv[1] == "--cleanup-force"
+    if len(args) == 1 and args[0] in {"--status", "--info"}:
+        print_status_banner(include_protocol=True)
+        return 0
+
+    if len(args) == 1 and args[0] == "--install-id":
+        print(INSTALL_ID)
+        return 0
+
+    if len(args) == 1 and args[0] == "--register-only":
+        reg_res = register_protocol_handler(SCRIPT_PATH)
+        if reg_res.get("replaced_foreign"):
+            print(f"[Protocol] Updated clipbridge:// from previous target ({reg_res.get('previous_target')}).")
+        print_status_banner(include_protocol=True)
+        return 0
+
+    if len(args) == 1 and args[0] == "--unregister":
+        res = unregister_protocol_handler(SCRIPT_PATH)
+        prefix = "[REMOVED]" if res.get("removed") else ("[SKIPPED]" if res.get("status") == "skipped" else "[INFO]")
+        print(f"{prefix} {res.get('message', '')}")
+        return 0
+
+    if len(args) == 1 and args[0] == "--install-startup":
+        vbs = install_startup_launcher()
+        print(f"[INSTALLED] Startup launcher: {vbs}")
+        return 0
+
+    if len(args) == 1 and args[0] == "--uninstall-startup":
+        res = uninstall_startup_launchers()
+        for name in res["removed"]:
+            print(f"[REMOVED] Startup launcher: {name}")
+        for msg in res["skipped"]:
+            print(f"[SKIPPED] Startup launcher: {msg}")
+        return 0
+
+    if len(args) == 1 and args[0] == "--uninstall-firewall":
+        res = uninstall_owned_firewall_rules(PORT, INSTALL_ID, SCRIPT_PATH)
+        for name in res["removed"]:
+            print(f"[REMOVED] Firewall rule: {name}")
+        for msg in res["skipped"]:
+            print(f"[SKIPPED] Firewall rule: {msg}")
+        if res.get("needs_elevation"):
+            print("[WARNING] Administrator rights are required to delete this installation's firewall rule.")
+            return 2
+        return 0 if res.get("status") == "ok" else 1
+
+    if len(args) == 1 and args[0] == "--check-firewall":
+        rule_name = get_firewall_rule_name(PORT, INSTALL_ID)
+        rules = inspect_firewall_rules_windows([rule_name])
+        if rules is None:
+            return 2
+        if not rules:
+            return 1
+        owned = all(parse_firewall_ownership(str(r.get("Description", "")), INSTALL_ID, SCRIPT_PATH) for r in rules)
+        return 0 if owned else 2
+
+    if len(args) == 1 and args[0] in {"--cleanup", "--cleanup-force"}:
+        force = args[0] == "--cleanup-force"
         result = run_cli_cleanup(force=force)
+        if result.get("status") == "aborted":
+            print(f"[ABORTED] {result.get('warning', 'Cleanup aborted safely.')}")
+            return 1
         print(f"Reclaimed : {result.get('reclaimed_human', '0 B')} ({result.get('reclaimed_count', 0)} item(s))")
         if result.get("warning"):
             print(f"Warning   : {result['warning']}")
-        return
+        return 0
 
-    register_protocol_handler()
+    if args:
+        print(f"[ERROR] Invalid or unrecognized arguments: {' '.join(args)}", file=sys.stderr)
+        return 2
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--register-only":
-        print_status_banner()
-        return
-
-    startup_res = HISTORY.cleanup_orphans_on_startup(force=False)
-    print_status_banner()
-    if startup_res.get("reclaimed_count"):
-        print(
-            f"[Storage] Reclaimed {startup_res['reclaimed_human']} from previous session "
-            f"({startup_res['reclaimed_count']} orphaned item(s))."
-        )
-    if startup_res.get("warning"):
-        print(f"[Storage] {startup_res['warning']}")
-
-    stop_event = threading.Event()
-
-    def _maintenance_loop():
-        while not stop_event.wait(60):
-            try:
-                HISTORY.cleanup(force=False)
-            except Exception:
-                pass
-
-    threading.Thread(target=_maintenance_loop, daemon=True).start()
-    server = ClipBridgeHTTPServer(("0.0.0.0", PORT), ClipboardRequestHandler)
+    # Normal server mode: never auto-register clipbridge:// protocol!
+    HISTORY.ensure_storage_ownership()
+    lock_fh = acquire_server_lock(HISTORY.temp_dir, PORT, INSTALL_ID, SCRIPT_PATH)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        startup_res = HISTORY.cleanup_orphans_on_startup(force=False)
+        print_status_banner(include_protocol=True)
+        if startup_res.get("reclaimed_count"):
+            print(
+                f"[Storage] Reclaimed {startup_res['reclaimed_human']} from previous session "
+                f"({startup_res['reclaimed_count']} orphaned item(s))."
+            )
+        if startup_res.get("warning"):
+            print(f"[Storage] {startup_res['warning']}")
+
+        stop_event = threading.Event()
+
+        def _maintenance_loop():
+            while not stop_event.wait(60):
+                try:
+                    HISTORY.cleanup(force=False)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_maintenance_loop, daemon=True).start()
+        server = ClipBridgeHTTPServer(("0.0.0.0", PORT), ClipboardRequestHandler)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_event.set()
+            server.server_close()
     finally:
-        stop_event.set()
-        server.server_close()
+        release_server_lock(lock_fh)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

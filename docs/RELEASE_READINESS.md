@@ -8,7 +8,7 @@ The source was recovered from the repository's uploaded `ClipBridge-v1.0.0.zip` 
 
 - [ ] GitHub PR merged after code and secret review; source appears as individual files on `main`
 - [x] All GitHub Actions checks green on both Windows and Ubuntu, on supported Python versions
-- [x] Run `python -m unittest discover -s tests -v` and inspect results, not just exit code (`29/29` passed)
+- [x] Run `python -m unittest discover -s tests -v` and inspect results, not just exit code (`34/34` passed)
 - [ ] Run `python clipboard_bridge.py` on a fresh Windows 11 installation with Python 3.10+ (verified in an isolated directory/port `5059` on Windows 11 + Python 3.14.3; full default-port `5050` cutover pending owner approval to stop legacy `D:\ClipboardBridge`)
 - [x] Confirm the manager does not terminate any unrelated process that uses port 5050 (verified live: `:STOP_PORT` left legacy PID `11348` on port `5050` running while stopping isolated PID `12040` on port `5059`)
 - [x] Confirm ordinary server startup/restart is blocked in elevated sessions; configure Windows Firewall using option 7 only
@@ -51,8 +51,8 @@ An older prototype installation (`D:\ClipboardBridge\clipboard_bridge.py`, runni
 
 1. In an **Administrator** PowerShell/Command Prompt, stop the elevated legacy process (`Stop-Process -Id 11348 -Force`) and remove the legacy broad firewall rule (`netsh advfirewall firewall delete rule name="ClipboardBridge_5050"`).
 2. Remove `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ClipboardBridge_SilentStartup.vbs`.
-3. In the **Administrator** window, run the new `manage.bat` and select **`[7] Configure Private LAN Firewall Only`** to create `ClipBridge_5050` restricted to `profile=private remoteip=localsubnet`, then close the Administrator window.
-4. In a **normal (non-elevated)** window, run `manage.bat` and select **`[1] Install & Start Silently`** to register `clipbridge://`, generate `config.json`, create `ClipBridge_SilentStartup.vbs`, and start the server without elevation.
+3. In the **Administrator** window, run the new `manage.bat` and select **`[7] Configure Private LAN Firewall Only`** to create the installation-scoped rule (`ClipBridge_<port>_<install_id>`) restricted to `profile=private remoteip=localsubnet`, then close the Administrator window.
+4. In a **normal (non-elevated)** window, run `manage.bat` and select **`[1] Install & Start Silently`** to register `clipbridge://`, generate `config.json`, create the installation-scoped startup launcher (`ClipBridge_<install_id>.vbs`), and start the server without elevation.
 5. Re-import `/setup/shortcuts.json?key=<new_secret_key>` in Android HTTP Shortcuts.
 
 ## Known high-priority residual risks

@@ -52,10 +52,10 @@ ClipBridge takes a minimal approach:
 2. Run `manage.bat` as a **normal Windows user** (do not use **Run as administrator** for installation or restart).
 3. Press **`1`** (**Install & Start Silently**). This will:
    * Auto-create `config.json` with a random `secret_key`, your Windows `Downloads` path, and bounded temp storage defaults (`max_storage_mb`: `1024`, `retention_minutes`: `60`).
-   * Register the `clipbridge://` protocol for the Toast **Save to Downloads** button.
-   * Check the existing Windows Firewall rule. If Android cannot connect, reopen **a separate** `manage.bat` window as Administrator and choose **option 7 — Configure Private LAN Firewall Only**. Close that elevated window afterward; start and restart ClipBridge only from a normal user session.
-   * Add a silent startup launcher to your current user's Windows Startup folder and start the server **without administrator privileges**.
-   * You can also use option **`6`** in `manage.bat` (or `python clipboard_bridge.py --cleanup`) anytime to clean inactive temporary files without disturbing active clipboard transfers.
+   * Explicitly register the `clipbridge://` protocol for this installation's Toast **Save to Downloads** button (read-only status option **`2`** and ordinary server restarts never overwrite an existing registration).
+   * Check this installation's Windows Firewall rule (`ClipBridge_<port>_<install_id>`). If Android cannot connect, reopen **a separate** `manage.bat` window as Administrator and choose **option 7 — Configure Private LAN Firewall Only**. Close that elevated window afterward; start and restart ClipBridge only from a normal user session.
+   * Add an installation-scoped silent startup launcher (`ClipBridge_<install_id>.vbs`) to your current user's Windows Startup folder and start the server **without administrator privileges**.
+   * You can also use option **`6`** in `manage.bat` (or `python clipboard_bridge.py --cleanup`) anytime to clean inactive temporary files without disturbing active clipboard transfers; option **`5`** removes only integrations owned by the current installation.
 4. Note the **Web Dashboard URL** and **Import from URL** printed in the terminal.
 
 ### 2. Connect from Android (Choose Either Method)
@@ -101,7 +101,7 @@ See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the full API and compon
 
 ClipBridge is designed for **trusted home or private Wi-Fi networks**:
 * **Authentication**: All endpoints except `/ping` require a matching `secret_key` (`X-Secret-Key` header or `?key=` query parameter), verified with constant-time `secrets.compare_digest`.
-* **Local storage**: ClipBridge does not use a cloud service. Uploaded and cached history files under `%TEMP%\ClipBridge` are bounded by `max_history_items` (`25`), `retention_minutes` (`60`), and `max_storage_mb` (`1024`), and orphaned files from prior sessions are reclaimed on server startup (preserving files still held on the live Windows clipboard). **Clean Temp** and **Clear** are non-destructive by default and warn before deleting files still referenced by the Windows clipboard. Do not use shared computers for sensitive transfers.
+* **Local storage**: ClipBridge does not use a cloud service. Uploaded and cached history files are isolated per installation under `%TEMP%\ClipBridge\installs\<install_id>` (with `.owner.json` ownership verification), bounded by `max_history_items` (`25`), `retention_minutes` (`60`), and `max_storage_mb` (`1024`), and orphaned files from prior sessions of that installation are reclaimed on server startup (preserving files still held on the live Windows clipboard). **Clean Temp**, **Clear**, and `--cleanup` are non-destructive by default, abort if server/storage ownership cannot be verified, and warn before deleting files still referenced by the Windows clipboard. Do not use shared computers for sensitive transfers.
 * **Upload & filename safeguards**: Text payloads are capped at 2 MB, file uploads are capped at 512 MB by default (`max_upload_mb` in `config.json`, bounded by `max_storage_mb`), concurrent inflight uploads are isolated and resource-bounded, and filenames are sanitized against path traversal and Windows reserved device names.
 * **Important limitation (No TLS)**: Transfers and bearer credentials travel over **unencrypted HTTP**. Use only a trusted private LAN; never expose port `5050` to the internet. Browser links containing `?key=` may be retained in browser history or copied accidentally. ClipBridge is not end-to-end encrypted and is not recommended for secrets or sensitive documents.
 
