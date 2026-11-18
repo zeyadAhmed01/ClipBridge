@@ -1,0 +1,39 @@
+name: Bug Report
+description: Report a crash, connection failure, or unexpected behavior in ClipBridge
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps (e.g., running manage.bat, tapping Send Text to PC, etc.)
+    validations:
+      required: true
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows Version & Python Version
+      placeholder: "e.g., Windows 11 23H2, Python 3.12.4"
+    validations:
+      required: true
+  - type: input
+    id: android_info
+    attributes:
+      label: Android Version & Method Used
+      placeholder: "e.g., Android 14, HTTP Shortcuts v3.x or Chrome"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal output or error message
+      description: Paste any terminal output (remember to remove your secret_key!).
+      render: text

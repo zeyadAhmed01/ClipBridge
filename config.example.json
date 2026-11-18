@@ -1,0 +1,9 @@
+{
+  "port": 5050,
+  "secret_key": "replace-with-your-secret-key",
+  "save_folder": "C:\\Users\\YourUsername\\Downloads",
+  "max_history_items": 25,
+  "max_upload_mb": 512,
+  "max_storage_mb": 1024,
+  "retention_minutes": 60
+}
